@@ -1,7 +1,7 @@
-use tokio::net::TcpListener;
-use std::sync::{Arc, Mutex};
-use std::collections::{HashMap, VecDeque};
 use protocol::messages::Command;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
 
 pub struct Agent {
     pub id: u32,
@@ -15,7 +15,9 @@ pub struct CommandQueue {
 
 impl CommandQueue {
     pub fn new() -> Self {
-        Self { pending: VecDeque::new() }
+        Self {
+            pending: VecDeque::new(),
+        }
     }
 
     pub fn push(&mut self, cmd: Command) {
@@ -45,9 +47,9 @@ impl C2Core {
         println!("C2 Core listening on port {}", port);
 
         loop {
-            let (socket, addr) = listener.accept().await?;
+            let (_socket, addr) = listener.accept().await?;
             println!("New connection from: {}", addr);
-            
+
             // In a real implementation, we would perform the mTLS handshake here
             // and then spawn a task to handle the communication with this specific agent.
             tokio::spawn(async move {
@@ -59,8 +61,8 @@ impl C2Core {
     /// Registers a new agent into the pool with its own command queue
     pub fn register_client(&self, id: u32, ip: String) {
         let mut clients = self.clients.lock().unwrap();
-        clients.insert(id, (Agent { id, ip }, CommandQueue::new()));
         println!("Registered client {} from {}", id, ip);
+        clients.insert(id, (Agent { id, ip }, CommandQueue::new()));
     }
 
     /// Queues a command for a specific agent
@@ -79,5 +81,22 @@ impl C2Core {
                 println!("Dispatching {:?} to agent {}", cmd, id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::C2Core;
+
+    #[test]
+    fn register_client_stores_the_agent_address() {
+        let core = C2Core::new();
+        core.register_client(7, "127.0.0.1".to_string());
+
+        let clients = core.clients.lock().unwrap();
+        let (agent, queue) = clients.get(&7).expect("client should be registered");
+        assert_eq!(agent.id, 7);
+        assert_eq!(agent.ip, "127.0.0.1");
+        assert!(queue.pending.is_empty());
     }
 }
