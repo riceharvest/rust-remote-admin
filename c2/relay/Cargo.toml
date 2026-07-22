@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 log = "0.4"
+crypto = { path = "../../crypto" }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
