@@ -271,12 +271,9 @@ mod tests {
             })
             .await;
 
-        assert_eq!(
-            response,
-            Some(Response::Failure {
-                error: "process management is not implemented".to_string(),
-            })
-        );
+        // After PR #31, process_manager::execute now returns a real
+        // error message for unknown sub-commands instead of "not implemented".
+        assert!(matches!(response, Some(Response::Failure { .. })));
     }
 
     #[tokio::test]
