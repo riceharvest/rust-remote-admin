@@ -1,11 +1,29 @@
 use protocol::messages::Command;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+
+/// Maximum time since last heartbeat before an agent is considered stale.
+const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Maximum time since last heartbeat before an agent is considered disconnected.
+const DEFAULT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct Agent {
     pub id: u32,
     pub ip: String,
+    pub last_heartbeat: Instant,
+}
+
+impl Agent {
+    fn new(id: u32, ip: String) -> Self {
+        Self {
+            id,
+            ip,
+            last_heartbeat: Instant::now(),
+        }
+    }
 }
 
 /// A queue of commands waiting to be sent to a specific agent.
@@ -30,7 +48,7 @@ impl CommandQueue {
 
 #[derive(Default)]
 pub struct C2Core {
-    // Tracks all connected agents with their IDs, IPs, and individual command queues
+    /// Tracks all connected agents with their IDs, IPs, and individual command queues
     pub clients: Arc<Mutex<HashMap<u32, (Agent, CommandQueue)>>>,
 }
 
@@ -60,7 +78,50 @@ impl C2Core {
     pub fn register_client(&self, id: u32, ip: String) {
         let mut clients = self.clients.lock().expect("C2Core lock poisoned");
         log::info!("Registered client {id} from {ip}");
-        clients.insert(id, (Agent { id, ip }, CommandQueue::new()));
+        clients.insert(id, (Agent::new(id, ip), CommandQueue::new()));
+    }
+
+    /// Record a heartbeat from an agent, updating its last-seen timestamp.
+    pub fn record_heartbeat(&self, id: u32) {
+        let mut clients = self.clients.lock().expect("C2Core lock poisoned");
+        if let Some((agent, _)) = clients.get_mut(&id) {
+            agent.last_heartbeat = Instant::now();
+            log::info!("Heartbeat received from agent {id}");
+        } else {
+            log::warn!("Heartbeat from unknown agent {id}");
+        }
+    }
+
+    /// Returns the number of agents in each health state.
+    ///
+    /// Returns `(healthy, stale, disconnected)` based on heartbeat timeouts.
+    pub fn health_summary(&self) -> (usize, usize, usize) {
+        let clients = self.clients.lock().expect("C2Core lock poisoned");
+        let now = Instant::now();
+        let mut healthy = 0usize;
+        let mut stale = 0usize;
+        let mut disconnected = 0usize;
+
+        for (_, (agent, _)) in clients.iter() {
+            let elapsed = now.duration_since(agent.last_heartbeat);
+            if elapsed > DEFAULT_DISCONNECT_TIMEOUT {
+                disconnected += 1;
+            } else if elapsed > DEFAULT_HEARTBEAT_TIMEOUT {
+                stale += 1;
+            } else {
+                healthy += 1;
+            }
+        }
+
+        (healthy, stale, disconnected)
+    }
+
+    /// Remove a disconnected agent from the pool.
+    pub fn remove_client(&self, id: u32) {
+        let mut clients = self.clients.lock().expect("C2Core lock poisoned");
+        if clients.remove(&id).is_some() {
+            log::info!("Removed agent {id} from pool");
+        }
     }
 
     /// Queues a command for a specific agent
@@ -100,5 +161,28 @@ mod tests {
         assert_eq!(agent.id, 7);
         assert_eq!(agent.ip, "127.0.0.1");
         assert!(queue.pending.is_empty());
+    }
+
+    #[test]
+    fn record_heartbeat_updates_timestamp() {
+        let core = C2Core::new();
+        core.register_client(1, "10.0.0.1".to_string());
+        core.record_heartbeat(1);
+
+        let clients = core.clients.lock().expect("C2Core lock poisoned");
+        let (agent, _) = clients.get(&1).expect("client should exist");
+        // The timestamp should be recent (within the last second)
+        assert!(
+            std::time::Instant::now().duration_since(agent.last_heartbeat).as_secs() < 2
+        );
+    }
+
+    #[test]
+    fn remove_client_cleans_pool() {
+        let core = C2Core::new();
+        core.register_client(5, "10.0.0.5".to_string());
+        core.remove_client(5);
+        let clients = core.clients.lock().expect("C2Core lock poisoned");
+        assert!(clients.get(&5).is_none());
     }
 }
