@@ -9,15 +9,14 @@ pub struct Agent {
 }
 
 /// A queue of commands waiting to be sent to a specific agent.
+#[derive(Default)]
 pub struct CommandQueue {
     pub pending: VecDeque<Command>,
 }
 
 impl CommandQueue {
     pub fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-        }
+        Self::default()
     }
 
     pub fn push(&mut self, cmd: Command) {
@@ -29,6 +28,7 @@ impl CommandQueue {
     }
 }
 
+#[derive(Default)]
 pub struct C2Core {
     // Tracks all connected agents with their IDs, IPs, and individual command queues
     pub clients: Arc<Mutex<HashMap<u32, (Agent, CommandQueue)>>>,
@@ -36,9 +36,7 @@ pub struct C2Core {
 
 impl C2Core {
     pub fn new() -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     /// Listens for incoming agent connections on the specified port.

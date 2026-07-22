@@ -1,11 +1,13 @@
 pub mod anti_debug {
     /// Checks if the process is currently being debugged.
+    #[must_use]
     pub fn is_being_debugged() -> bool {
         // Placeholder for IsDebuggerPresent or similar logic
-        false 
+        false
     }
 
     /// Checks if the process is running in a virtual machine.
+    #[must_use]
     pub fn is_in_vm() -> bool {
         // Placeholder for checking common VM artifacts (e.g., 'VMware', 'VirtualBox')
         false
