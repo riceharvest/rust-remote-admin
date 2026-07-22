@@ -1,7 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-use tauri::Manager;
-
 pub struct AppState {
     pub clients: Arc<Mutex<Vec<String>>>,
     pub logs: Arc<Mutex<Vec<String>>>,
@@ -46,22 +44,20 @@ mod tests {
 }
 
 #[tauri::command]
-pub fn add_client(state: tauri::State<AppState>, app: tauri::AppHandle, id: String) -> String {
+fn add_client(state: tauri::State<'_, AppState>, id: String) -> String {
     let message = state.add_client(&id);
-    if let Err(error) = app.emit_all("log-update", &message) {
-        log::warn!("failed to emit log-update event: {error}");
-    }
+    log::info!("Added client {id}");
     message
 }
 
 #[tauri::command]
-pub fn get_clients(state: tauri::State<AppState>) -> Vec<String> {
+fn get_clients(state: tauri::State<'_, AppState>) -> Vec<String> {
     let clients = state.clients.lock().expect("AppState lock poisoned");
     clients.clone()
 }
 
 #[tauri::command]
-pub fn get_logs(state: tauri::State<AppState>) -> Vec<String> {
+fn get_logs(state: tauri::State<'_, AppState>) -> Vec<String> {
     let logs = state.logs.lock().expect("AppState lock poisoned");
     logs.clone()
 }
