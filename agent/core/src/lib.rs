@@ -7,6 +7,7 @@ pub struct AgentCore {
 }
 
 impl AgentCore {
+    #[must_use]
     pub fn new(id: u32) -> Self {
         Self { id }
     }
@@ -17,15 +18,15 @@ impl AgentCore {
         }
 
         match cmd {
-            command @ Command::Execute { cmd } => {
+            cmd_ref @ Command::Execute { cmd } => {
                 if cmd.starts_with("proc:") {
-                    process_manager::execute(command).await
+                    process_manager::execute(cmd_ref).await
                 } else if cmd.starts_with("file:") {
-                    file_manager::execute(command).await
+                    file_manager::execute(cmd_ref).await
                 } else if cmd.starts_with("reg:") {
-                    registry_manager::execute(command).await
+                    registry_manager::execute(cmd_ref).await
                 } else {
-                    process_manager::execute(command).await
+                    process_manager::execute(cmd_ref).await
                 }
             }
             Command::GetSysInfo => monitoring::get_sysinfo().await,
@@ -34,7 +35,7 @@ impl AgentCore {
         }
     }
 
-    pub async fn heartbeat(&self) -> Response {
+    pub fn heartbeat(&self) -> Response {
         Response::Success
     }
 }
