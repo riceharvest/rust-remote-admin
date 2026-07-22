@@ -7,3 +7,16 @@ edition = "2021"
 aes-gcm = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.8"
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+self-signed-certs = ["rcgen"]
+testing = ["rcgen", "tempfile"]
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
