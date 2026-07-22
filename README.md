@@ -38,18 +38,17 @@ Not implemented:
 
 ## Build and test
 
-The non-GUI workspace can be checked and tested with:
+The full workspace builds and tests with:
 
 ```sh
-cargo check --workspace --exclude c2-gui
-cargo test --workspace --exclude c2-gui
+cargo check --workspace
+cargo test --workspace
 ```
 
-The GUI requires the Tauri v1 Linux development dependencies, including GTK/WebKitGTK and `libsoup-2.4`. After installing those system packages, run:
+The GUI requires Tauri v2 Linux development dependencies: `webkit2gtk4.1-devel` (brings in `libsoup3-devel` and `javascriptcoregtk4.1-devel`). Install with:
 
 ```sh
-cargo check -p c2-gui
-cargo test -p c2-gui
+sudo dnf install webkit2gtk4.1-devel
 ```
 
 ## License
