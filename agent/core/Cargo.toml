@@ -9,3 +9,6 @@ log = { workspace = true }
 protocol = { path = "../../protocol" }
 agent_modules = { path = "../modules", package = "agent-modules" }
 agent_hardening = { path = "../hardening", package = "agent-hardening" }
+crypto = { path = "../../crypto" }
+tokio-rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
