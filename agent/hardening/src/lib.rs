@@ -18,3 +18,5 @@ pub mod string_obfuscation {
     /// Example of a simple obfuscated string helper.
     pub const AGENT_ID: &str = "agent_v1"; // In production, this would be encrypted/obfuscated at compile time
 }
+
+pub mod persistence;
