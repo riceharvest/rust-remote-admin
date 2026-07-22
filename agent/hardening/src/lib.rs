@@ -1,3 +1,5 @@
+pub mod injection;
+
 pub mod anti_debug {
     /// Checks if the process is currently being debugged.
     #[must_use]
