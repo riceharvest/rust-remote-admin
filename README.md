@@ -1,31 +1,57 @@
 # Rust Remote Admin
 
-A remote administration tool built entirely in Rust, targeting Windows 10/11.
+A Rust research scaffold for authenticated remote-management components.
 
-## Features
+This repository is not a production remote-administration system. Agent operations that could access files, processes, registries, system information, or execute code are intentionally disabled until they have a documented design, authorization model, and platform-specific implementation.
 
-- **C2 Server**: Tauri Desktop GUI for operators.
-- **Agent**: Lightweight Windows implant with modular architecture.
-- **Relay Server**: Optional TCP/TLS relay for traffic redirection and anonymity.
+## Components
 
-## Modules (Agent)
+- `c2/core`: Client registry and per-client command queues.
+- `c2/gui`: Tauri dashboard with client and log views.
+- `c2/plugins`: Minimal operator-side plugin trait and echo example.
+- `c2/relay`: Tokio TCP relay library.
+- `agent/core`: Command routing and heartbeat scaffold.
+- `agent/modules`: Explicit failure responses for unsupported agent operations.
+- `agent/hardening`: Placeholder capability checks. It does not provide stealth or evasion.
+- `protocol`: Shared command and response types.
+- `crypto`: AES-GCM payload encryption with a fresh nonce per message and typed errors.
 
-| Category   | Features                                      |
-|------------|------------------------------------------------|
-| Monitoring | Hidden VNC/RDP, Webcam, Microphone, Keylogger    |
-| Manager    | Process, File, Registry, Network, Startup        |
-| Execution  | Remote CMD, Reflective DLL Injection, Self-Update|
+## Current status
 
-## Quick Start
+Implemented and tested:
 
-```bash
-# Build all crates
-cargo build
+- Workspace manifest and local crate paths.
+- FIFO command queues using `VecDeque`.
+- Bidirectional relay copying.
+- GUI client and log state updates.
+- GUI `log-update` events with polling fallback.
+- AES-GCM round trips, nonce uniqueness, wrong-key rejection, and tamper rejection.
+- Truthful failure responses for unsupported agent operations.
 
-# Run C2 server (Linux/macOS)
-cargo run -p c2-core
+Not implemented:
+
+- mTLS session handling.
+- Agent connection management.
+- Process, file, registry, or system-information collection.
+- Remote command execution.
+- DLL injection, persistence, keylogging, webcam, microphone, hidden desktop capture, or anti-analysis behavior.
+
+## Build and test
+
+The non-GUI workspace can be checked and tested with:
+
+```sh
+cargo check --workspace --exclude c2-gui
+cargo test --workspace --exclude c2-gui
+```
+
+The GUI requires the Tauri v1 Linux development dependencies, including GTK/WebKitGTK and `libsoup-2.4`. After installing those system packages, run:
+
+```sh
+cargo check -p c2-gui
+cargo test -p c2-gui
 ```
 
 ## License
 
-MIT (for educational/research purposes)
+MIT. Use this scaffold only for lawful, authorized research and administration.
