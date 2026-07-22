@@ -2,6 +2,7 @@ use crypto::tls::{build_mtls_acceptor, load_certs, load_private_key, TlsError};
 use protocol::messages::Command;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -22,12 +23,6 @@ impl Default for ConnectionState {
     }
 }
 
-pub struct Agent {
-    pub id: u32,
-    pub ip: String,
-    pub state: ConnectionState,
-}
-
 /// TLS configuration for the C2 listener.
 #[derive(Clone)]
 pub enum ListenerTls {
@@ -39,100 +34,124 @@ pub enum ListenerTls {
     Mutual(TlsAcceptor),
 }
 
+/// Maximum time since last heartbeat before an agent is considered stale.
+const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Maximum time since last heartbeat before an agent is considered disconnected.
+const DEFAULT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(300);
+
+pub struct Agent {
+    pub id: u32,
+    pub ip: String,
+    pub last_heartbeat: Instant,
+    pub state: ConnectionState,
+}
+
+impl Agent {
+    fn new(id: u32, ip: String) -> Self {
+        Self {
+            id,
+            ip,
+            last_heartbeat: Instant::now(),
+            state: ConnectionState::Connected,
+        }
+    }
+}
+
 /// A queue of commands waiting to be sent to a specific agent.
 #[derive(Default)]
 pub struct CommandQueue {
-    pub pending: VecDeque<Command>,
+    pending: VecDeque<Command>,
 }
 
 impl CommandQueue {
-    pub fn new() -> Self {
-        Self::default()
+    fn new() -> Self {
+        Self { pending: VecDeque::new() }
     }
-
-    pub fn push(&mut self, cmd: Command) {
+    fn push(&mut self, cmd: Command) {
         self.pending.push_back(cmd);
     }
 
-    pub fn pop(&mut self) -> Option<Command> {
+    fn pop(&mut self) -> Option<Command> {
         self.pending.pop_front()
     }
 }
 
-#[derive(Default)]
+/// The C2 server core: holds registered agents, command queues, and TLS config.
 pub struct C2Core {
-    /// Tracks all connected agents with their IDs, IPs, and individual command queues
     pub clients: Arc<Mutex<HashMap<u32, (Agent, CommandQueue)>>>,
-    /// Optional TLS acceptor for wrapped connections.
     pub tls: Option<ListenerTls>,
 }
 
+impl Default for C2Core {
+    fn default() -> Self {
+        Self {
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            tls: None,
+        }
+    }
+}
+
 impl C2Core {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Configure mTLS on this core from PEM file paths.
-    ///
-    /// The CA cert is used to verify client certificates; the server cert/key
-    /// are presented to clients during the handshake.
-    pub fn configure_mtls(
-        &mut self,
-        server_cert_path: &str,
-        server_key_path: &str,
-        ca_cert_path: &str,
-    ) -> Result<(), TlsError> {
-        let server_certs = load_certs(server_cert_path)?;
-        let server_key = load_private_key(server_key_path)?;
-        let ca_cert = load_certs(ca_cert_path)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| TlsError::CertParse("CA certificate file is empty".into()))?;
-
-        let acceptor = build_mtls_acceptor(server_certs, server_key, ca_cert)?;
-        self.tls = Some(ListenerTls::Mutual(acceptor));
-        log::info!("mTLS configured on C2 core");
-        Ok(())
+    /// Configure the listener for plain TCP (no TLS).
+    pub fn configure_plain(&mut self) {
+        self.tls = Some(ListenerTls::Disabled);
     }
 
-    /// Configure server-only TLS (no client certificate required).
+    /// Configure the listener for TLS (server-auth only).
     pub fn configure_tls(
         &mut self,
-        server_cert_path: &str,
-        server_key_path: &str,
+        cert_path: &str,
+        key_path: &str,
     ) -> Result<(), TlsError> {
-        let server_certs = load_certs(server_cert_path)?;
-        let server_key = load_private_key(server_key_path)?;
-
-        let acceptor = crypto::tls::build_tls_acceptor(server_certs, server_key)?;
+        let certs = load_certs(cert_path)?;
+        let key = load_private_key(key_path)?;
+        let acceptor = crypto::tls::build_tls_acceptor(certs, key)?;
         self.tls = Some(ListenerTls::ServerOnly(acceptor));
-        log::info!("TLS configured on C2 core (server-auth only)");
         Ok(())
     }
 
-    /// Listens for incoming agent connections on the specified port.
-    ///
-    /// If TLS is configured, connections are wrapped before being accepted.
-    pub async fn run_listener(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-        let tls = self.tls.clone();
-        log::info!("C2 Core listening on port {port}");
+    /// Configure the listener for mutual TLS (client cert required).
+    pub fn configure_mtls(
+        &mut self,
+        cert_path: &str,
+        key_path: &str,
+        ca_cert_path: &str,
+    ) -> Result<(), TlsError> {
+        let certs = load_certs(cert_path)?;
+        let key = load_private_key(key_path)?;
+        let ca_certs = load_certs(ca_cert_path)?;
+        let acceptor = build_mtls_acceptor(certs, key, ca_certs.into_iter().next()
+            .ok_or_else(|| TlsError::CertParse("CA certificate file is empty".into()))?)?;
+        self.tls = Some(ListenerTls::Mutual(acceptor));
+        Ok(())
+    }
+
+    /// Bind and listen on the given address, accepting connections.
+    pub async fn run_listener(&self, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(addr).await?;
+        log::info!("C2 listener bound on {addr}");
 
         loop {
-            let (socket, addr) = listener.accept().await?;
-
-            match &tls {
-                Some(ListenerTls::Mutual(acceptor)) => {
-                    let acceptor = acceptor.clone();
+            let (socket, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("Accept failed: {e}");
+                    continue;
+                }
+            };
+            log::info!("New connection from {peer}");
+            match &self.tls {
+                Some(ListenerTls::Disabled) | None => {
+                    log::info!("New (cleartext) connection from: {peer}");
                     tokio::spawn(async move {
-                        match acceptor.accept(socket).await {
-                            Ok(_tls_stream) => {
-                                log::info!("mTLS connection from {addr}");
-                            }
-                            Err(e) => {
-                                log::error!("mTLS handshake failed from {addr}: {e}");
-                            }
-                        }
+                        // Connection handling logic goes here.
+                        let _ = socket;
                     });
                 }
                 Some(ListenerTls::ServerOnly(acceptor)) => {
@@ -140,18 +159,27 @@ impl C2Core {
                     tokio::spawn(async move {
                         match acceptor.accept(socket).await {
                             Ok(_tls_stream) => {
-                                log::info!("TLS connection from {addr}");
+                                log::info!("TLS handshake completed with {peer}");
+                                // Handle the TLS-wrapped connection.
                             }
                             Err(e) => {
-                                log::error!("TLS handshake failed from {addr}: {e}");
+                                log::error!("TLS handshake failed with {peer}: {e}");
                             }
                         }
                     });
                 }
-                Some(ListenerTls::Disabled) | None => {
-                    log::info!("New (cleartext) connection from: {addr}");
+                Some(ListenerTls::Mutual(acceptor)) => {
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
-                        // Connection handling logic goes here
+                        match acceptor.accept(socket).await {
+                            Ok(_tls_stream) => {
+                                log::info!("mTLS handshake completed with {peer}");
+                                // Handle the mTLS-wrapped connection.
+                            }
+                            Err(e) => {
+                                log::error!("mTLS handshake failed with {peer}: {e}");
+                            }
+                        }
                     });
                 }
             }
@@ -162,17 +190,42 @@ impl C2Core {
     pub fn register_client(&self, id: u32, ip: String) {
         let mut clients = self.clients.lock().expect("C2Core lock poisoned");
         log::info!("Registered client {id} from {ip}");
-        clients.insert(
-            id,
-            (
-                Agent {
-                    id,
-                    ip,
-                    state: ConnectionState::Connected,
-                },
-                CommandQueue::new(),
-            ),
-        );
+        clients.insert(id, (Agent::new(id, ip), CommandQueue::new()));
+    }
+
+    /// Record a heartbeat from an agent, updating its last-seen timestamp.
+    pub fn record_heartbeat(&self, id: u32) {
+        let mut clients = self.clients.lock().expect("C2Core lock poisoned");
+        if let Some((agent, _)) = clients.get_mut(&id) {
+            agent.last_heartbeat = Instant::now();
+            log::info!("Heartbeat received from agent {id}");
+        } else {
+            log::warn!("Heartbeat from unknown agent {id}");
+        }
+    }
+
+    /// Returns the number of agents in each health state.
+    ///
+    /// Returns `(healthy, stale, disconnected)` based on heartbeat timeouts.
+    pub fn health_summary(&self) -> (usize, usize, usize) {
+        let clients = self.clients.lock().expect("C2Core lock poisoned");
+        let now = Instant::now();
+        let mut healthy = 0usize;
+        let mut stale = 0usize;
+        let mut disconnected = 0usize;
+
+        for (_, (agent, _)) in clients.iter() {
+            let elapsed = now.duration_since(agent.last_heartbeat);
+            if elapsed > DEFAULT_DISCONNECT_TIMEOUT {
+                disconnected += 1;
+            } else if elapsed > DEFAULT_HEARTBEAT_TIMEOUT {
+                stale += 1;
+            } else {
+                healthy += 1;
+            }
+        }
+
+        (healthy, stale, disconnected)
     }
 
     /// Mark an agent as stale (missed heartbeats).
@@ -266,6 +319,20 @@ mod tests {
         assert_eq!(agent.ip, "127.0.0.1");
         assert!(matches!(agent.state, ConnectionState::Connected));
         assert!(queue.pending.is_empty());
+    }
+
+    #[test]
+    fn record_heartbeat_updates_timestamp() {
+        let core = C2Core::new();
+        core.register_client(1, "10.0.0.1".to_string());
+        core.record_heartbeat(1);
+
+        let clients = core.clients.lock().expect("C2Core lock poisoned");
+        let (agent, _) = clients.get(&1).expect("client should exist");
+        // The timestamp should be recent (within the last second)
+        assert!(
+            std::time::Instant::now().duration_since(agent.last_heartbeat).as_secs() < 2
+        );
     }
 
     #[test]
