@@ -5,9 +5,6 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-rustls = "0.21"
-serde = { version = "1.0", features = ["derive"] }
 protocol = { path = "../protocol" }
-crypto = { path = "../crypto" }
 modules = { path = "../modules" }
 hardening = { path = "../hardening" }

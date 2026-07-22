@@ -1,6 +1,6 @@
 use protocol::messages::{Command, Response};
 use agent_modules::{process_manager, file_manager, monitoring, registry_manager, execution};
-use agent_hardening::{anti_debug, string_obfuscation};
+use agent_hardening::{anti_debug};
 
 pub struct AgentCore {
     pub id: u32,
