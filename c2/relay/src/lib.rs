@@ -7,6 +7,7 @@ pub struct Relay {
 }
 
 impl Relay {
+    #[must_use]
     pub fn new(listen_addr: &str, upstream_addr: &str) -> Self {
         Self {
             listen_addr: listen_addr.to_string(),
@@ -16,7 +17,7 @@ impl Relay {
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.listen_addr).await?;
-        log::info!("Relay listening on {}", self.listen_addr);
+        log::info!("Relay listening on {listen_addr}", listen_addr = self.listen_addr);
 
         loop {
             let (mut inbound, _) = listener.accept().await?;
