@@ -1,14 +1,16 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io;
 
 pub struct Relay {
     pub listen_addr: String,
+    pub upstream_addr: String,
 }
 
 impl Relay {
-    pub fn new(listen_addr: &str) -> Self {
+    pub fn new(listen_addr: &str, upstream_addr: &str) -> Self {
         Self {
             listen_addr: listen_addr.to_string(),
+            upstream_addr: upstream_addr.to_string(),
         }
     }
 
@@ -17,19 +19,23 @@ impl Relay {
         println!("Relay listening on {}", self.listen_addr);
 
         loop {
-            let (mut socket, _) = listener.accept().await?;
+            let (mut inbound, _) = listener.accept().await?;
+            let upstream = self.upstream_addr.clone();
+
             tokio::spawn(async move {
-                // Simple transparent forwarding logic 
-                // For now: just read from one and write to another
-                // Real relay will handle upstream C2 mapping
-                let mut buffer = [0u8; 1024];
-                loop {
-                    match socket.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            socket.write_all(&buffer[..n]).await.unwrap();
+                match TcpStream::connect(&upstream).await {
+                    Ok(mut outbound) => {
+                        match io::copy_bidirectional(&mut inbound, &mut outbound).await {
+                            Ok((to_upstream, to_downstream)) => {
+                                println!("Relay session closed: {} bytes up, {} bytes down", to_upstream, to_downstream);
+                            }
+                            Err(e) => {
+                                eprintln!("Relay error: {}", e);
+                            }
                         }
-                        Err(_) => break,
+                    }
+                    Err(e) => {
+                        eprintln!("Relay failed to connect to upstream {}: {}", upstream, e);
                     }
                 }
             });
