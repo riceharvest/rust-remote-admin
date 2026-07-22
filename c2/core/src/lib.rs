@@ -1,6 +1,6 @@
 use tokio::net::TcpListener;
 use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use protocol::messages::Command;
 
 pub struct Agent {
@@ -10,24 +10,20 @@ pub struct Agent {
 
 /// A queue of commands waiting to be sent to a specific agent.
 pub struct CommandQueue {
-    pub pending: Vec<Command>,
+    pub pending: VecDeque<Command>,
 }
 
 impl CommandQueue {
     pub fn new() -> Self {
-        Self { pending: Vec::new() }
+        Self { pending: VecDeque::new() }
     }
 
     pub fn push(&mut self, cmd: Command) {
-        self.pending.push(cmd);
+        self.pending.push_back(cmd);
     }
 
     pub fn pop(&mut self) -> Option<Command> {
-        if self.pending.is_empty() {
-            None
-        } else {
-            Some(self.pending.remove(0))
-        }
+        self.pending.pop_front()
     }
 }
 
