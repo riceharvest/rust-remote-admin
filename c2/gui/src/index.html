@@ -46,6 +46,19 @@
             document.getElementById('connected_agents').textContent = t.connected_agents;
             document.getElementById('live_logs').textContent = t.live_logs;
             updateList();
+
+            // Listen for real-time log updates via Tauri events, fallback to polling
+            const { listen } = window.__TAURI__?.event ?? {};
+            if (listen) {
+                await listen('log-update', (event) => {
+                    const container = document.getElementById('log-container');
+                    const div = document.createElement('div');
+                    div.textContent = `> ${event.payload}`;
+                    container.appendChild(div);
+                });
+            } else {
+                setInterval(updateLogs, 5000);
+            }
         }
 
         async function updateList() {
@@ -81,7 +94,6 @@
         });
 
         init();
-        setInterval(updateLogs, 2000);
     </script>
 </body>
 </html>
