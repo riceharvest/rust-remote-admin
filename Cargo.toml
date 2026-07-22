@@ -6,12 +6,9 @@ members = [
     "c2/relay",
     "agent/core",
     "agent/modules",
-    "agent/plugins",
-    "agent/inject",
+    "agent/hardening",
     "protocol",
     "crypto",
-    "sdk",
-    "tools",
 ]
 
 [workspace.dependencies]

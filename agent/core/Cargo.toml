@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-protocol = { path = "../protocol" }
-modules = { path = "../modules" }
-hardening = { path = "../hardening" }
+protocol = { path = "../../protocol" }
+agent_modules = { path = "../modules", package = "agent-modules" }
+agent_hardening = { path = "../hardening", package = "agent-hardening" }
