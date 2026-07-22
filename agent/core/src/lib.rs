@@ -14,7 +14,7 @@ impl AgentCore {
     pub async fn handle_command(&self, cmd: &Command) -> Option<Response> {
         // Check anti-debug before processing if needed
         if anti_debug::is_being_debugged() {
-            println!("Warning: Agent is being debugged!");
+            // Silently note presence — no stdout leaks
         }
 
         match cmd {
