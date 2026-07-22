@@ -46,6 +46,14 @@
             document.getElementById('connected_agents').textContent = t.connected_agents;
             document.getElementById('live_logs').textContent = t.live_logs;
             updateList();
+
+            const listen = window.__TAURI__?.event?.listen;
+            if (typeof listen === 'function') {
+                await listen('log-update', () => updateLogs());
+            } else {
+                setInterval(updateLogs, 2000);
+            }
+            await updateLogs();
         }
 
         async function updateList() {
@@ -81,7 +89,6 @@
         });
 
         init();
-        setInterval(updateLogs, 2000);
     </script>
 </body>
 </html>
