@@ -294,3 +294,5 @@ pub mod injection;
 pub mod persistence;
 
 pub mod keylog;
+
+pub mod desktop_capture;
