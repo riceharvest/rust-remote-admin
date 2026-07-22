@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust Remote Admin - C2 Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body id="app">
+    <header>
+        <h1 id="title">C2 Dashboard</h1>
+    </header>
+    <main>
+        <section id="controls">
+            <button id="add-btn">Add Agent</button>
+            <input type="text" id="agent-id" placeholder="Agent ID (e.g. 1)">
+            <button id="submit-btn">Submit</button>
+        </section>
+        <div class="dashboard-grid">
+            <section id="status">
+                <h2 id="connected_agents">Connected Agents</h2>
+                <ul id="client-list"></ul>
+            </section>
+            <section id="logs">
+                <h2 id="live_logs">Live Logs</h2>
+                <div id="log-container" style="height: 200px; overflow-y: auto; background: #000; padding: 10px; font-family: monospace; font-size: 12px;"></div>
+            </section>
+        </div>
+    </main>
+    <script type="module">
+        const { invoke } = window.__TAURI__.invoke;
+
+        // Simple i18n loader
+        async function loadLocale() {
+            const response = await fetch('./locales/en.json');
+            return await response.json();
+        }
+
+        let t = {};
+
+        async function init() {
+            t = await loadLocale();
+            document.getElementById('title').textContent = t.title;
+            document.getElementById('add_btn').textContent = t.add_agent;
+            document.getElementById('submit_btn').textContent = t.submit; // Note: adjusted for ID consistency
+            document.getElementById('connected_agents').textContent = t.connected_agents;
+            document.getElementById('live_logs').textContent = t.live_logs;
+            updateList();
+        }
+
+        async function updateList() {
+            const clients = await invoke('get_clients');
+            const list = document.getElementById('client-list');
+            list.innerHTML = '';
+            clients.forEach(id => {
+                const li = document.createElement('li');
+                li.textContent = `Agent: ${id}`;
+                list.appendChild(li);
+            });
+        }
+
+        async function updateLogs() {
+            const logs = await invoke('get_logs');
+            const container = document.getElementById('log-container');
+            container.innerHTML = '';
+            logs.forEach(msg => {
+                const div = document.createElement('div');
+                div.textContent = `> ${msg}`;
+                container.appendChild(div);
+            });
+        }
+
+        document.getElementById('submit-btn').addEventListener('click', async () => {
+            const id = document.getElementById('agent-id').value;
+            if (id) {
+                await invoke('add_client', { id });
+                updateList();
+                updateLogs();
+                document.getElementById('agent-id').value = '';
+            }
+        });
+
+        init();
+        setInterval(updateLogs, 2000);
+    </script>
+</body>
+</html>

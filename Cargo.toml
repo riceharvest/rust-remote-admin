@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "c2/core",
+    "c2/gui",
+    "c2/plugins",
+    "c2/relay",
+    "agent/core",
+    "agent/modules",
+    "agent/plugins",
+    "agent/inject",
+    "protocol",
+    "crypto",
+    "sdk",
+    "tools",
+]
+
+[workspace.dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+prost = "0.12"
+rustls = "0.21"
+log = "0.4"
