@@ -18,10 +18,10 @@ impl Default for AppState {
 
 impl AppState {
     fn add_client(&self, id: &str) -> String {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().expect("AppState lock poisoned");
         clients.push(id.to_string());
         let msg = format!("Added client {id}");
-        let mut logs = self.logs.lock().unwrap();
+        let mut logs = self.logs.lock().expect("AppState lock poisoned");
         logs.push(msg.clone());
         msg
     }
@@ -56,13 +56,13 @@ pub fn add_client(state: tauri::State<AppState>, app: tauri::AppHandle, id: Stri
 
 #[tauri::command]
 pub fn get_clients(state: tauri::State<AppState>) -> Vec<String> {
-    let clients = state.clients.lock().unwrap();
+    let clients = state.clients.lock().expect("AppState lock poisoned");
     clients.clone()
 }
 
 #[tauri::command]
 pub fn get_logs(state: tauri::State<AppState>) -> Vec<String> {
-    let logs = state.logs.lock().unwrap();
+    let logs = state.logs.lock().expect("AppState lock poisoned");
     logs.clone()
 }
 

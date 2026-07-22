@@ -58,14 +58,14 @@ impl C2Core {
 
     /// Registers a new agent into the pool with its own command queue
     pub fn register_client(&self, id: u32, ip: String) {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().expect("C2Core lock poisoned");
         log::info!("Registered client {id} from {ip}");
         clients.insert(id, (Agent { id, ip }, CommandQueue::new()));
     }
 
     /// Queues a command for a specific agent
     pub fn queue_command(&self, id: u32, cmd: Command) {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().expect("C2Core lock poisoned");
         if let Some((_, queue)) = clients.get_mut(&id) {
             queue.push(cmd);
         } else {
@@ -75,7 +75,7 @@ impl C2Core {
 
     /// Processes all pending commands for a specific agent
     pub fn dispatch_commands(&self, id: u32) {
-        let mut clients = self.clients.lock().unwrap();
+        let mut clients = self.clients.lock().expect("C2Core lock poisoned");
         if let Some((_, queue)) = clients.get_mut(&id) {
             while let Some(cmd) = queue.pop() {
                 log::info!("Dispatching {cmd:?} to agent {id}");
@@ -95,7 +95,7 @@ mod tests {
         let core = C2Core::new();
         core.register_client(7, "127.0.0.1".to_string());
 
-        let clients = core.clients.lock().unwrap();
+        let clients = core.clients.lock().expect("C2Core lock poisoned");
         let (agent, queue) = clients.get(&7).expect("client should be registered");
         assert_eq!(agent.id, 7);
         assert_eq!(agent.ip, "127.0.0.1");
