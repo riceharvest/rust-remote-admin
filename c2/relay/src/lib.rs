@@ -16,7 +16,7 @@ impl Relay {
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(&self.listen_addr).await?;
-        println!("Relay listening on {}", self.listen_addr);
+        log::info!("Relay listening on {}", self.listen_addr);
 
         loop {
             let (mut inbound, _) = listener.accept().await?;
@@ -27,15 +27,15 @@ impl Relay {
                     Ok(mut outbound) => {
                         match io::copy_bidirectional(&mut inbound, &mut outbound).await {
                             Ok((to_upstream, to_downstream)) => {
-                                println!("Relay session closed: {} bytes up, {} bytes down", to_upstream, to_downstream);
+                                log::info!("Relay session closed: {to_upstream} bytes up, {to_downstream} bytes down");
                             }
                             Err(e) => {
-                                eprintln!("Relay error: {}", e);
+                                log::error!("Relay error: {e}");
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Relay failed to connect to upstream {}: {}", upstream, e);
+                        log::error!("Relay failed to connect to upstream {upstream}: {e}");
                     }
                 }
             });

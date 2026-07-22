@@ -44,11 +44,11 @@ impl C2Core {
     /// Listens for incoming agent connections on the specified port.
     pub async fn run_listener(&self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-        println!("C2 Core listening on port {}", port);
+        log::info!("C2 Core listening on port {port}");
 
         loop {
             let (_socket, addr) = listener.accept().await?;
-            println!("New connection from: {}", addr);
+            log::info!("New connection from: {addr}");
 
             // In a real implementation, we would perform the mTLS handshake here
             // and then spawn a task to handle the communication with this specific agent.
@@ -61,7 +61,7 @@ impl C2Core {
     /// Registers a new agent into the pool with its own command queue
     pub fn register_client(&self, id: u32, ip: String) {
         let mut clients = self.clients.lock().unwrap();
-        println!("Registered client {} from {}", id, ip);
+        log::info!("Registered client {id} from {ip}");
         clients.insert(id, (Agent { id, ip }, CommandQueue::new()));
     }
 
@@ -70,6 +70,8 @@ impl C2Core {
         let mut clients = self.clients.lock().unwrap();
         if let Some((_, queue)) = clients.get_mut(&id) {
             queue.push(cmd);
+        } else {
+            log::warn!("queue_command: unknown agent {id}");
         }
     }
 
@@ -78,8 +80,10 @@ impl C2Core {
         let mut clients = self.clients.lock().unwrap();
         if let Some((_, queue)) = clients.get_mut(&id) {
             while let Some(cmd) = queue.pop() {
-                println!("Dispatching {:?} to agent {}", cmd, id);
+                log::info!("Dispatching {cmd:?} to agent {id}");
             }
+        } else {
+            log::warn!("dispatch_commands: unknown agent {id}");
         }
     }
 }
