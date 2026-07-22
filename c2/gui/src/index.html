@@ -28,7 +28,7 @@
         </div>
     </main>
     <script type="module">
-        const { invoke } = window.__TAURI__.invoke;
+        const { invoke } = window.__TAURI__;
 
         // Simple i18n loader
         async function loadLocale() {
@@ -41,8 +41,8 @@
         async function init() {
             t = await loadLocale();
             document.getElementById('title').textContent = t.title;
-            document.getElementById('add_btn').textContent = t.add_agent;
-            document.getElementById('submit_btn').textContent = t.submit; // Note: adjusted for ID consistency
+            document.getElementById('add-btn').textContent = t.add_agent;
+            document.getElementById('submit-btn').textContent = t.submit;
             document.getElementById('connected_agents').textContent = t.connected_agents;
             document.getElementById('live_logs').textContent = t.live_logs;
             updateList();
