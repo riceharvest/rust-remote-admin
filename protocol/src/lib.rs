@@ -1,3 +1,4 @@
+pub mod config;
 pub mod messages {
     use serde::{Deserialize, Serialize};
 

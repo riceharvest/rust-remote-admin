@@ -5,6 +5,7 @@ members = [
     "c2/gui",
     "c2/plugins",
     "c2/relay",
+    "c2/generator",
     "agent/core",
     "agent/modules",
     "agent/hardening",
@@ -21,3 +22,7 @@ tokio-rustls = "0.26"
 rustls-pki-types = "1.10"
 rcgen = "0.13"
 tempfile = "3"
+anyhow = "1.0"
+sha2 = "0.10"
+serde_json = "1.0"
+clap = { version = "4.0", features = ["derive"] }

@@ -1,0 +1,11 @@
+[package]
+name = "c2-generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../../protocol" }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
+log = { workspace = true }

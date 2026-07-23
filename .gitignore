@@ -30,3 +30,5 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+# Build-generated config slot
+agent/core/src/embedded_config.rs
