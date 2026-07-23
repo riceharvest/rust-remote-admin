@@ -20,3 +20,4 @@ agent_hardening = { path = "../hardening", package = "agent-hardening" }
 crypto = { path = "../../crypto" }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+serde_json = { workspace = true }
