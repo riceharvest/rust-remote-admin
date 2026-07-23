@@ -74,6 +74,7 @@ dependencies = [
  "protocol",
  "sysinfo",
  "tokio",
+ "windows 0.57.0",
 ]
 
 [[package]]
