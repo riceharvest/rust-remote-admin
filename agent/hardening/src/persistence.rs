@@ -412,34 +412,78 @@ X-GNOME-Autostart-enabled=true
 ///
 /// # Research example
 ///
-/// Adds a value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+/// Adds a value under `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`
 /// so the program starts automatically at user login. Only available on
 /// Windows.
 ///
-/// # Note
+/// Uses `reg.exe add` via `std::process::Command` — no unsafe FFI or
+/// external crate required.
 ///
-/// This is a **stub** — the implementation requires the `winreg` crate
-/// or raw Win32 API calls and has not been tested on a Windows host.
+/// # Errors
+///
+/// Returns an error if `reg.exe` exits with a non-zero status.
 #[cfg(windows)]
 pub fn install_registry_run(name: &str, path: &str) -> PersistenceResult<()> {
-    Err(format!(
-        "not yet implemented: install_registry_run({name:?}, {path:?}) — requires winreg crate"
-    )
-    .into())
+    let output = Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            name,
+            "/t",
+            "REG_SZ",
+            "/d",
+            path,
+            "/f",
+        ])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("reg add failed: {stderr}").into())
+    }
 }
 
 /// Remove a Windows Registry Run key (HKCU).
 ///
 /// # Research example
 ///
-/// Deletes the value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+/// Deletes the value under `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`.
 ///
-/// # Note
+/// # Errors
 ///
-/// This is a **stub** — not yet implemented.
+/// Returns an error only if the deletion fails for a reason other than
+/// the key not existing (e.g. access denied). Does **not** return an
+/// error if the key was already absent.
 #[cfg(windows)]
 pub fn uninstall_registry_run(name: &str) -> PersistenceResult<()> {
-    Err(format!("not yet implemented: uninstall_registry_run({name:?})").into())
+    let output = Command::new("reg")
+        .args([
+            "delete",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            name,
+            "/f",
+        ])
+        .output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // reg delete exits with code 1 when the key/value does not exist —
+    // treat that as success since the end state is the same.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("unable to find")
+        || stderr.contains("does not exist")
+        || stderr.contains("not found")
+    {
+        Ok(())
+    } else {
+        Err(format!("reg delete failed: {stderr}").into())
+    }
 }
 
 /// Install a Windows Scheduled Task.
@@ -447,18 +491,34 @@ pub fn uninstall_registry_run(name: &str) -> PersistenceResult<()> {
 /// # Research example
 ///
 /// Creates a scheduled task via `schtasks.exe` that runs the given
-/// executable at user logon.
+/// executable at user logon with limited privileges.
 ///
-/// # Note
+/// # Errors
 ///
-/// This is a **stub** — the implementation requires `schtasks.exe`
-/// to be present and has not been tested.
+/// Returns an error if `schtasks.exe` exits with a non-zero status.
 #[cfg(windows)]
 pub fn install_scheduled_task(name: &str, path: &str) -> PersistenceResult<()> {
-    Err(format!(
-        "not yet implemented: install_scheduled_task({name:?}, {path:?}) — requires schtasks.exe"
-    )
-    .into())
+    let output = Command::new("schtasks")
+        .args([
+            "/create",
+            "/tn",
+            name,
+            "/tr",
+            path,
+            "/sc",
+            "onlogon",
+            "/rl",
+            "limited",
+            "/f",
+        ])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("schtasks /create failed: {stderr}").into())
+    }
 }
 
 /// Remove a Windows Scheduled Task.
@@ -467,12 +527,32 @@ pub fn install_scheduled_task(name: &str, path: &str) -> PersistenceResult<()> {
 ///
 /// Deletes the scheduled task via `schtasks.exe /delete`.
 ///
-/// # Note
+/// # Errors
 ///
-/// This is a **stub** — not yet implemented.
+/// Returns an error only if the deletion fails for a reason other than
+/// the task not existing. Does **not** return an error if the task was
+/// already absent.
 #[cfg(windows)]
 pub fn uninstall_scheduled_task(name: &str) -> PersistenceResult<()> {
-    Err(format!("not yet implemented: uninstall_scheduled_task({name:?})").into())
+    let output = Command::new("schtasks")
+        .args(["/delete", "/tn", name, "/f"])
+        .output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // schtasks /delete exits with code 1 when the task does not exist —
+    // treat that as success since the end state is the same.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("does not exist")
+        || stderr.contains("not found")
+        || stderr.contains("no tasks")
+    {
+        Ok(())
+    } else {
+        Err(format!("schtasks /delete failed: {stderr}").into())
+    }
 }
 
 // ---------------------------------------------------------------------------
