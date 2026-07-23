@@ -147,7 +147,6 @@ pub fn inject_dll(target_pid: u32, dll_path: &str) -> Result<(), InjectionError>
         .ok_or(InjectionError::NotFound)?;
 
     let loadlibrary_addr = unsafe { GetProcAddress(kernel32, PCSTR(b"LoadLibraryW\0".as_ptr())) }
-        .ok_or(InjectionError::NotFound)?
         .ok_or(InjectionError::NotFound)?;
 
     // Step 6: Create the remote thread.
