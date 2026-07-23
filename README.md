@@ -23,24 +23,39 @@ Download both from [GitHub Releases](https://github.com/riceharvest/rust-remote-
 # 1. Start the C2 server
 rust-remote-admin-c2 server 0.0.0.0:9000
 
-# 2. (in another terminal) Generate a configured agent
+# 2. (in another terminal) Generate a single configured agent
 rust-remote-admin-c2 generate-agent \
   --c2-address 192.168.1.100:9000 \
   --cert-fingerprint sha256:abc123... \
   --agent-id 1 \
   --output client.exe
 
-# (--template is optional — defaults to embedded template)
-# Override with an external template:
+# (--template is optional — defaults to embedded template, use to override)
 #   --template custom-agent.exe
 
-# 3. Deploy client.exe on the target machine
-#    It connects to 192.168.1.100:9000 and waits for commands
-
-# 4. Verify template integrity
+# 3. Batch generation: 10 agents with sequential IDs
 rust-remote-admin-c2 generate-agent \
-  --template rust-remote-admin-agent.exe \
-  --hash-template
+  --c2-address 10.0.0.1:9000 \
+  --cert-fingerprint sha256:abc123... \
+  --agent-id 100 \
+  --count 10 \
+  --output agent.exe
+# Produces: agent-100.exe, agent-101.exe, ..., agent-109.exe
+
+# 4. mTLS: embed client certificate paths
+rust-remote-admin-c2 generate-agent \
+  --c2-address 10.0.0.1:9000 \
+  --cert-fingerprint sha256:abc123... \
+  --agent-id 50 \
+  --cert-path /etc/client.pem \
+  --key-path /etc/client.key \
+  --output agent-golden.exe
+
+# 5. Deploy the generated agent on the target machine
+#    It connects to the C2 and waits for commands
+
+# 6. Verify template integrity
+rust-remote-admin-c2 generate-agent --hash-template
 ```
 
 **How it works:**
@@ -77,10 +92,10 @@ Download `rust-remote-admin-c2.exe` (or `rust-remote-admin-c2` for Linux) from [
 The `RRA_CONFIG_V1` marker occupies 512 bytes in the agent binary:
 
 ```
-Offset 0:  "RRA_CONFIG_V1"  (11 bytes, magic marker)
-Offset 11: <u32 LE length>   (4 bytes, JSON payload length)
-Offset 15: <JSON payload>     (up to 497 bytes of AgentConfig)
-Remainder: <zero padding>     (filled to 512 bytes total)
+Offset  0: "RRA_CONFIG_V1"  (13 bytes, magic marker)
+Offset 13: <u32 LE length>  (4 bytes, JSON payload length)
+Offset 17: <JSON payload>   (up to 495 bytes of AgentConfig)
+Remainder: <zero padding>   (filled to 512 bytes total)
 ```
 
 The agent scans its own executable at startup for the marker. The C2 generator finds the same marker and replaces the block.
@@ -103,7 +118,7 @@ The agent scans its own executable at startup for the marker. The C2 generator f
 
 ```sh
 cargo check --workspace
-cargo test --workspace     # 62+ tests
+cargo test --workspace     # 71+ tests
 ```
 
 ### Cross-compile Windows executables
@@ -139,11 +154,11 @@ cargo build -p c2-gui
 - ✅ mTLS cert/key paths can be embedded in agent config (`--cert-path`, `--key-path`)
 - ✅ Batch `generate-agent` mode (`--count N` generates sequential agents)
 - ✅ Integration tests for generator (marker detection, single/batch, mTLS fields)
+- ✅ Web UI for agent generation in Tauri GUI (generate_agent command + form)
 - ✅ 71 tests pass
 
 ### Next
 - ⬜ Windows tests for generated agent config loading
-- ⬜ Web UI for agent generation in Tauri GUI
 
 ## Security note
 
