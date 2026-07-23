@@ -15,15 +15,19 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - name: Install MinGW
         run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - name: Build Windows binaries
-        run: cargo build --release --target x86_64-pc-windows-gnu -p c2-core -p agent-core
-      - name: Upload artifacts
+      - name: Build agent template (for C2 embedding)
+        run: cargo build --release --target x86_64-pc-windows-gnu -p agent-core
+      - name: Build C2 (embeds agent template)
+        run: cargo build --release --target x86_64-pc-windows-gnu -p c2-core
+      - name: Verify template was embedded
+        run: |
+          grep -q 'RRA_CONFIG_V1' target/x86_64-pc-windows-gnu/release/rust-remote-admin-c2.exe || \
+          (echo "ERROR: C2 missing embedded template" && exit 1)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-binaries
-          path: |
-            target/x86_64-pc-windows-gnu/release/rust-remote-admin-c2.exe
-            target/x86_64-pc-windows-gnu/release/rust-remote-admin-agent.exe
+          name: windows-c2
+          path: target/x86_64-pc-windows-gnu/release/rust-remote-admin-c2.exe
 
   build-linux:
     runs-on: ubuntu-latest
@@ -32,15 +36,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux dev deps (for GUI)
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-      - name: Build Linux binaries
-        run: cargo build --release -p c2-core -p agent-core
-      - name: Upload artifacts
+      - name: Build agent template (for C2 embedding)
+        run: cargo build --release -p agent-core
+      - name: Build C2 (embeds agent template)
+        run: cargo build --release -p c2-core
+      - name: Verify template was embedded
+        run: |
+          grep -q 'RRA_CONFIG_V1' target/release/rust-remote-admin-c2 || \
+          (echo "ERROR: C2 missing embedded template" && exit 1)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-binaries
-          path: |
-            target/release/rust-remote-admin-c2
-            target/release/rust-remote-admin-agent
+          name: linux-c2
+          path: target/release/rust-remote-admin-c2
 
   release:
     needs: [build-windows, build-linux]
@@ -51,38 +59,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: windows-binaries
+          name: windows-c2
           path: windows/
       - uses: actions/download-artifact@v4
         with:
-          name: linux-binaries
+          name: linux-c2
           path: linux/
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             windows/rust-remote-admin-c2.exe
-            windows/rust-remote-admin-agent.exe
             linux/rust-remote-admin-c2
-            linux/rust-remote-admin-agent
           body: |
-            **Two components — C2 control binary + agent template.**
+            **Single binary — the C2 has the agent template embedded.**
 
-            **Usage:**
-            1. Download `rust-remote-admin-c2` (or `.exe`) for your platform
-            2. Download `rust-remote-admin-agent` (or `.exe`) — the template
-            3. Generate a configured agent:
-               ```
-               ./rust-remote-admin-c2 generate-agent \
-                 --template rust-remote-admin-agent.exe \
-                 --c2-address <C2_IP>:9000 \
-                 --cert-fingerprint <TLS_HASH> \
-                 --agent-id 1 \
-                 --output client.exe
-               ```
-            4. Start the C2 server:
-               ```
-               ./rust-remote-admin-c2 server 0.0.0.0:9000
-               ```
+            ```
+            # Generate a configured agent (no external template needed)
+            ./rust-remote-admin-c2 generate-agent \
+              --c2-address <C2_IP>:9000 \
+              --cert-fingerprint <TLS_HASH> \
+              --agent-id 1 \
+              --output client.exe
 
-            No external dependencies required.
+            # Start the C2 server
+            ./rust-remote-admin-c2 server 0.0.0.0:9000
+
+            # Deploy client.exe on the target — it connects back automatically
+            ```
+
+            The agent template is compiled into the C2 binary. No separate download needed.
