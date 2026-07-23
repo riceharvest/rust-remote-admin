@@ -33,3 +33,4 @@ build/
 # Build-generated config slots
 agent/core/src/embedded_config.rs
 c2/core/src/embedded_agent.rs
+c2/gui/src/embedded_agent.rs

@@ -9,3 +9,6 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 sha2 = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

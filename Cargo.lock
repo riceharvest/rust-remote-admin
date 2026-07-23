@@ -370,12 +370,15 @@ dependencies = [
  "log",
  "protocol",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
 name = "c2-gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "c2-generator",
  "log",
  "protocol",
  "serde",

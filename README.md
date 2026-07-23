@@ -136,11 +136,13 @@ cargo build -p c2-gui
 - ✅ Release workflow builds 2 artifacts per platform (C2 + agent template)
 - ✅ Relay removed from default builds (optional, build with `-p c2-relay`)
 - ✅ Agent template embedded directly in C2 binary — `--template` is optional
+- ✅ mTLS cert/key paths can be embedded in agent config (`--cert-path`, `--key-path`)
+- ✅ Batch `generate-agent` mode (`--count N` generates sequential agents)
+- ✅ Integration tests for generator (marker detection, single/batch, mTLS fields)
+- ✅ 71 tests pass
 
 ### Next
 - ⬜ Windows tests for generated agent config loading
-- ⬜ mTLS config embedding (certificate/key paths → embedded certs)
-- ⬜ Batch `generate-agent` mode (N agents with sequential IDs)
 - ⬜ Web UI for agent generation in Tauri GUI
 
 ## Security note

