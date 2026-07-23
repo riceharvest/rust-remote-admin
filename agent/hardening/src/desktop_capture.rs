@@ -158,44 +158,89 @@ pub fn enumerate_displays() -> Result<Vec<DisplayInfo>, CaptureError> {
 
 /// Capture a single frame from the desktop.
 ///
-/// This is a research stub. The actual capture flows are documented
-/// below; implementing them requires platform-specific crates
-/// (`x11rb` / `xcb` on X11, `pipewire` / `gstreamer` on Wayland,
-/// `windows` crate for GDI/DXGI).
-///
-/// # X11 capture flow (Linux, `x11rb` crate)
-/// 1. `x11rb::connect()` → conn
-/// 2. `conn.setup().roots[0]` → screen
-/// 3. `conn.get_image(...)` → raw pixel data
-/// 4. Or use SHM: `xcb_shm_attach`, `shmget`, `XShmGetImage`
-///
-/// # PipeWire capture flow (Linux Wayland)
-/// 1. `dbus` → `org.freedesktop.portal.ScreenCast`
-/// 2. `CreateSession` → `CreateDialog` (user must consent)
-/// 3. `SelectSources` → `Start` → ` pipewire-stream`
-/// 4. `pw_stream_new`, `pw_stream_connect`, `on_process` → buffer
-///
-/// # GDI capture flow (Windows)
-/// 1. `GetDC(NULL)` → hdc
-/// 2. `CreateCompatibleDC` → memdc
-/// 3. `CreateCompatibleBitmap` → hbm
-/// 4. `SelectObject(memdc, hbm)`
-/// 5. `BitBlt(memdc, 0, 0, w, h, hdc, 0, 0, SRCCOPY)`
-/// 6. `GetDIBits(memdc, hbm, ...)` → raw pixels
-///
-/// # DXGI Desktop Duplication (Windows)
-/// 1. `D3D11CreateDevice` → device
-/// 2. `IDXGIOutput1::DuplicateOutput` → dup
-/// 3. `dup.AcquireNextFrame` → frame
+/// On Linux X11, uses `x11rb` to capture the root window's pixels.
+/// Other platforms currently return `Err(UnsupportedPlatform)`.
 pub fn capture_desktop_frame() -> Result<ScreenFrame, CaptureError> {
     let source = detect_display_subsystem();
     match source {
-        DisplaySource::X11
-        | DisplaySource::PipeWire
+        DisplaySource::X11 => capture_x11_frame(),
+        DisplaySource::PipeWire
         | DisplaySource::Gdi
         | DisplaySource::Dxgi => Err(CaptureError::UnsupportedPlatform),
         DisplaySource::Unknown => Err(CaptureError::NoDisplay),
     }
+}
+
+/// Capture a frame on X11 using `x11rb`.
+#[cfg(target_os = "linux")]
+fn capture_x11_frame() -> Result<ScreenFrame, CaptureError> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    // Connect to the X server
+    let (conn, screen_num) = x11rb::connect(None)
+        .map_err(|e| CaptureError::OpenFailed(format!("X11 connect: {e}")))?;
+
+    let screen = &conn.setup().roots[screen_num];
+    let root = screen.root;
+    let width = screen.width_in_pixels;
+    let height = screen.height_in_pixels;
+
+    // Grab the full-screen image
+    let cookie = conn
+        .get_image(
+            x11rb::protocol::xproto::ImageFormat::Z_PIXMAP,
+            root,
+            0,   // x offset
+            0,   // y offset
+            width,
+            height,
+            !0,  // plane mask: all planes
+        )
+        .map_err(|e| CaptureError::ReadFailed(format!("get_image send: {e}")))?;
+
+    let reply = cookie
+        .reply()
+        .map_err(|e| CaptureError::ReadFailed(format!("get_image reply: {e}")))?;
+
+    let raw = reply.data;
+    let depth = reply.depth;
+
+    // The X11 GetImage reply is typically in the server's native byte
+    // order (little-endian), which means BGR (depth 24) or BGRA (depth 32).
+    // Convert to RGB24 by swapping the R and B bytes.
+    let data: Vec<u8> = match depth {
+        24 => {
+            // BGR -> RGB (3 bytes per pixel)
+            raw.chunks_exact(3)
+                .flat_map(|p| [p[2], p[1], p[0]])
+                .collect()
+        }
+        32 => {
+            // BGRA -> RGB (4 bytes per pixel, drop alpha)
+            raw.chunks_exact(4)
+                .flat_map(|p| [p[2], p[1], p[0]])
+                .collect()
+        }
+        other => {
+            // Unknown depth — return as-is (may contain garbage)
+            return Err(CaptureError::ReadFailed(format!(
+                "unsupported bit depth: {other}"
+            )));
+        }
+    };
+
+    Ok(ScreenFrame {
+        width: u32::from(width),
+        height: u32::from(height),
+        data,
+    })
+}
+
+/// Stub for non-Linux platforms (x11rb unavailable).
+#[cfg(not(target_os = "linux"))]
+fn capture_x11_frame() -> Result<ScreenFrame, CaptureError> {
+    Err(CaptureError::UnsupportedPlatform)
 }
 
 /// Save a `ScreenFrame` as a raw RGB24 file (`.raw`).
@@ -271,9 +316,15 @@ mod tests {
     #[test]
     fn capture_desktop_frame_returns_error_on_stub() {
         let result = capture_desktop_frame();
+        // On a Linux X11 machine, this may now succeed (Ok) or fail to
+        // open the X display (OpenFailed). On other platforms it still
+        // returns UnsupportedPlatform or NoDisplay.
         assert!(matches!(
             result,
-            Err(CaptureError::UnsupportedPlatform) | Err(CaptureError::NoDisplay)
+            Ok(_)
+                | Err(CaptureError::UnsupportedPlatform)
+                | Err(CaptureError::NoDisplay)
+                | Err(CaptureError::OpenFailed(_))
         ));
     }
 
