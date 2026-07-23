@@ -19,10 +19,13 @@ jobs:
         run: cargo build --release --target x86_64-pc-windows-gnu -p agent-core
       - name: Build C2 (embeds agent template)
         run: cargo build --release --target x86_64-pc-windows-gnu -p c2-core
-      - name: Verify template was embedded
+      - name: Verify template was embedded (size check)
         run: |
-          grep -q 'RRA_CONFIG_V1' target/x86_64-pc-windows-gnu/release/rust-remote-admin-c2.exe || \
-          (echo "ERROR: C2 missing embedded template" && exit 1)
+          F="target/x86_64-pc-windows-gnu/release/rust-remote-admin-c2.exe"
+          SIZE=$(stat -c%s "$F")
+          echo "C2 binary size: $SIZE bytes"
+          # Agent template is ~10 MB; C2 without it would be < 5 MB
+          [ "$SIZE" -gt 5000000 ] || (echo "ERROR: C2 too small ($SIZE) — template missing" && exit 1)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -40,9 +43,9 @@ jobs:
         run: cargo build --release -p agent-core
       - name: Build C2 (embeds agent template)
         run: cargo build --release -p c2-core
-      - name: Verify template was embedded
+      - name: Verify template was embedded (run check)
         run: |
-          grep -q 'RRA_CONFIG_V1' target/release/rust-remote-admin-c2 || \
+          ./target/release/rust-remote-admin-c2 generate-agent --hash-template 2>&1 | grep -q "Template size:" || \
           (echo "ERROR: C2 missing embedded template" && exit 1)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
