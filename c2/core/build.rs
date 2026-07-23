@@ -44,9 +44,12 @@ fn main() {
     let rs_path = src_dir.join("embedded_agent.rs");
 
     // Search candidates relative to workspace root
+    let env_candidate = env::var("RRA_AGENT_TEMPLATE").ok().map(|p| {
+        let pb = PathBuf::from(&p);
+        if pb.is_relative() { ws_root.join(&p) } else { pb }
+    });
     let candidates: Vec<PathBuf> = vec![
-        // Env var override (absolute path)
-        env::var("RRA_AGENT_TEMPLATE").ok().map(PathBuf::from),
+        env_candidate,
         // Windows cross-compile target (release)
         Some(ws_root.join("target/x86_64-pc-windows-gnu/release/rust-remote-admin-agent.exe")),
         // Native Linux release

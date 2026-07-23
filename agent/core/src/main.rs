@@ -5,6 +5,12 @@ use std::fs;
 // Include the build-script generated config slot.
 mod embedded_config;
 
+// Reference the static to prevent it from being stripped.
+#[allow(dead_code)]
+const _: () = {
+    let _ = &embedded_config::RRA_CONFIG_SLOT;
+};
+
 const CONFIG_MARKER: &[u8] = b"RRA_CONFIG_V1";
 
 /// Read the embedded config from this executable's own binary.
