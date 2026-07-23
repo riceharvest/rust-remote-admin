@@ -25,11 +25,14 @@ rust-remote-admin-c2 server 0.0.0.0:9000
 
 # 2. (in another terminal) Generate a configured agent
 rust-remote-admin-c2 generate-agent \
-  --template rust-remote-admin-agent.exe \
   --c2-address 192.168.1.100:9000 \
   --cert-fingerprint sha256:abc123... \
   --agent-id 1 \
   --output client.exe
+
+# (--template is optional — defaults to embedded template)
+# Override with an external template:
+#   --template custom-agent.exe
 
 # 3. Deploy client.exe on the target machine
 #    It connects to 192.168.1.100:9000 and waits for commands
@@ -41,11 +44,18 @@ rust-remote-admin-c2 generate-agent \
 ```
 
 **How it works:**
-- A pre-compiled agent template ships alongside the C2 binary
-- The template has a zero-filled `RRA_CONFIG_V1` marker in its data section
-- `generate-agent` locates the marker and writes JSON config (C2 address, TLS fingerprint, agent ID, heartbeat interval) into the 512-byte config slot
+- A pre-compiled agent template is embedded in the C2 binary at build time
+- The template has a `RRA_CONFIG_V1` marker in its data section
+- `generate-agent` (without `--template`) uses the embedded template, locates the marker, and writes JSON config (C2 address, TLS fingerprint, agent ID, heartbeat interval) into the 512-byte config slot
 - The resulting `.exe` is standalone — the agent reads its own binary at startup, finds the marker, and parses the config
 - Falls back to CLI args or defaults if no embedded config is present
+- Use `--template <path>` to override with an external `.exe`
+
+### Release artifacts
+
+Download `rust-remote-admin-c2.exe` (or `rust-remote-admin-c2` for Linux) from [GitHub Releases](https://github.com/riceharvest/rust-remote-admin/releases). That single binary is all you need — the agent template is already inside it.
+
+`rust-remote-admin-agent.exe` is also published as a build artifact so you can inspect or override it, but you do not need to download it to use the tool.
 
 ## Crates
 
@@ -125,9 +135,9 @@ cargo build -p c2-gui
 - ✅ CLI `generate-agent` subcommand with `--template`, `--c2-address`, `--cert-fingerprint`, `--agent-id`, `--hash-template`
 - ✅ Release workflow builds 2 artifacts per platform (C2 + agent template)
 - ✅ Relay removed from default builds (optional, build with `-p c2-relay`)
+- ✅ Agent template embedded directly in C2 binary — `--template` is optional
 
 ### Next
-- ⬜ Embed agent template directly in C2 binary (remove need for separate template file)
 - ⬜ Windows tests for generated agent config loading
 - ⬜ mTLS config embedding (certificate/key paths → embedded certs)
 - ⬜ Batch `generate-agent` mode (N agents with sequential IDs)
