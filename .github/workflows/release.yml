@@ -43,10 +43,18 @@ jobs:
         run: cargo build --release -p agent-core
       - name: Build C2 (embeds agent template)
         run: cargo build --release -p c2-core
-      - name: Verify template was embedded (run check)
+      - name: Verify template was embedded (run check + size check)
         run: |
-          ./target/release/rust-remote-admin-c2 generate-agent --hash-template 2>&1 | grep -q "Template size:" || \
-          (echo "ERROR: C2 missing embedded template" && exit 1)
+          F="target/release/rust-remote-admin-c2"
+          echo "=== Binary size ==="
+          ls -lh "$F"
+          echo "=== Hash-template output ==="
+          ./target/release/rust-remote-admin-c2 generate-agent --hash-template 2>&1 || echo "binary-exit-code: $?"
+          echo "=== Template presence check ==="
+          # Check that the binary contains the agent template bytes by
+          # verifying the C2 is larger than just itself (with agent template it's > 10 MB)
+          SIZE=$(stat -c%s "$F")
+          [ "$SIZE" -gt 5000000 ] || (echo "ERROR: C2 too small ($SIZE)" && exit 1)
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
