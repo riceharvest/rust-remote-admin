@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install MinGW
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Build Windows binaries
+        run: cargo build --release --target x86_64-pc-windows-gnu -p agent-core -p c2-core -p c2-relay
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            target/x86_64-pc-windows-gnu/release/rust-remote-admin-agent.exe
+            target/x86_64-pc-windows-gnu/release/rust-remote-admin-c2.exe
+            target/x86_64-pc-windows-gnu/release/rust-remote-admin-relay.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dev deps (for GUI)
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+      - name: Build Linux binaries
+        run: cargo build --release -p agent-core -p c2-core -p c2-relay
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            target/release/rust-remote-admin-agent
+            target/release/rust-remote-admin-c2
+            target/release/rust-remote-admin-relay
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries
+          path: windows/
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: linux/
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            windows/rust-remote-admin-agent.exe
+            windows/rust-remote-admin-c2.exe
+            windows/rust-remote-admin-relay.exe
+            linux/rust-remote-admin-agent
+            linux/rust-remote-admin-c2
+            linux/rust-remote-admin-relay
+          body: |
+            Standalone executables — no external dependencies required.
+
+            **Windows:** .exe files run on any Windows 10/11 system.
+            **Linux:** binaries run on any modern x86_64 Linux system.
