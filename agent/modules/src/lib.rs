@@ -16,6 +16,7 @@ pub mod process_manager {
             match raw.strip_prefix("proc:") {
                 Some("list") => list_processes().await,
                 Some(kill_id) if raw.starts_with("proc:kill:") => {
+                    // See issue #55 — kill_process_windows is #[cfg(windows)]
                     kill_process(kill_id.trim_start_matches("kill:")).await
                 }
                 Some(other) => Some(Response::Failure {
@@ -91,11 +92,22 @@ pub mod process_manager {
         }
         #[cfg(not(windows))]
         {
+            // Terminates a process on Windows via the Win32 `TerminateProcess` FFI.
+            //
+            // # Note
+            //
+            // This stub exists only on non-Windows targets. Use `kill_process_posix` for
+            // signal-based process termination on Unix platforms.
             let _ = pid;
             Some(Response::Failure {
-                error: "process termination is not available on this platform".into(),
+                error: "kill_process_windows is only available on Windows targets".into(),
             })
         }
+    }
+
+    /// Returns true if the Windows-specific kill path is available on the current target.
+    pub fn kill_process_available() -> bool {
+        cfg!(target_os = "windows")
     }
 }
 
@@ -302,8 +314,6 @@ pub mod execution {
             "ip ",
             "ss ",
             "ping -c ",
-            "curl ",
-            "wget ",
             "systemctl status ",
             "journalctl ",
             "free ",
@@ -348,6 +358,10 @@ pub mod execution {
         }
     }
 
+    /// Agent self-update stub.
+    ///
+    /// Protocol message: Response::Failure with error explaining
+    /// the feature is not implemented. See issue #48.
     pub async fn self_update() -> Option<Response> {
         Some(Response::Failure {
             error: "self-update is not implemented".into(),
