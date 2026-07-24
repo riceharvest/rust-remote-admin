@@ -167,4 +167,123 @@ impl Relay {
                         }
                     }
                 }
-            });\n        }\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use tokio::io::{AsyncReadExt, AsyncWriteExt};\n    use tokio::net::TcpListener as TokioTcpListener;\n\n    // ------------------------------------------------------------------\n    // 1. Relay::new() stores addresses and sets Cleartext mode\n    // ------------------------------------------------------------------\n    #[test]\n    fn test_relay_new() {\n        let relay = Relay::new(\"0.0.0.0:9999\", \"10.0.0.1:8080\");\n        assert_eq!(relay.listen_addr, \"0.0.0.0:9999\");\n        assert_eq!(relay.upstream_addr, \"10.0.0.1:8080\");\n        assert!(matches!(relay.mode, RelayMode::Cleartext));\n    }\n\n    // ------------------------------------------------------------------\n    // 2. with_tls_ingress / with_tls_egress error on bad cert paths\n    // ------------------------------------------------------------------\n    #[test]\n    fn test_with_tls_ingress_bad_path() {\n        let dir = tempfile::tempdir().unwrap();\n        let bad_cert = dir.path().join(\"not-a-cert.pem\");\n        std::fs::write(&bad_cert, b\"this is not a valid PEM certificate\").unwrap();\n\n        let bad_key = dir.path().join(\"not-a-key.pem\");\n        std::fs::write(&bad_key, b\"this is not a valid PEM private key\").unwrap();\n\n        let relay = Relay::new(\"0.0.0.0:0\", \"127.0.0.1:1\");\n        let result = relay.with_tls_ingress(\n            bad_cert.to_str().unwrap(),\n            bad_key.to_str().unwrap(),\n        );\n        assert!(result.is_err(), \"expected TlsError from bad cert path\");\n    }\n\n    #[test]\n    fn test_with_tls_egress_bad_path() {\n        let dir = tempfile::tempdir().unwrap();\n        let bad_cert = dir.path().join(\"not-a-cert.pem\");\n        std::fs::write(&bad_cert, b\"this is not a valid PEM certificate\").unwrap();\n\n        let relay = Relay::new(\"0.0.0.0:0\", \"127.0.0.1:1\");\n        let result = relay.with_tls_egress(\n            bad_cert.to_str().unwrap(),\n            \"example.com\",\n        );\n        assert!(result.is_err(), \"expected TlsError from bad cert path\");\n    }\n\n    // ------------------------------------------------------------------\n    // 3. Integration: cleartext relay forwarding via echo server\n    // ------------------------------------------------------------------\n    #[tokio::test]\n    async fn test_cleartext_relay_forwards_bytes() {\n        // Start an echo server on a random port.\n        let echo_listener = TokioTcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let echo_addr = echo_listener.local_addr().unwrap();\n\n        tokio::spawn(async move {\n            loop {\n                let (mut stream, _) = echo_listener.accept().await.unwrap();\n                tokio::spawn(async move {\n                    let mut buf = [0u8; 4096];\n                    loop {\n                        match stream.read(&mut buf).await {\n                            Ok(0) => break,\n                            Ok(n) => {\n                                if stream.write_all(&buf[..n]).await.is_err() {\n                                    break;\n                                }\n                            }\n                            Err(_) => break,\n                        }\n                    }\n                });\n            }\n        });\n\n        // Start a cleartext relay pointing at the echo server.\n        let relay_listener = TokioTcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let relay_addr = relay_listener.local_addr().unwrap();\n\n        let relay = Relay {\n            listen_addr: relay_addr.to_string(),\n            upstream_addr: echo_addr.to_string(),\n            mode: RelayMode::Cleartext,\n        };\n\n        // Manually accept on the relay's port and forward via the relay logic.\n        // We spawn the accept loop ourselves so we stay in control.\n        tokio::spawn(async move {\n            loop {\n                let (mut inbound, _) = relay_listener.accept().await.unwrap();\n                let upstream = relay.upstream_addr.clone();\n                tokio::spawn(async move {\n                    if let Ok(mut outbound) = TcpStream::connect(&upstream).await {\n                        let _ = io::copy_bidirectional(&mut inbound, &mut outbound).await;\n                    }\n                });\n            }\n        });\n\n        // Connect to the relay and send test bytes.\n        let mut client = TcpStream::connect(relay_addr).await.unwrap();\n        let payload = b\"hello relay world!\";\n        client.write_all(payload).await.unwrap();\n\n        // Read back the echoed bytes (the relay forwards to echo, which echoes back).\n        let mut echo_buf = vec![0u8; payload.len()];\n        client.read_exact(&mut echo_buf).await.unwrap();\n\n        assert_eq!(&echo_buf, payload);\n    }\n}
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    // ------------------------------------------------------------------
+    // 1. Relay::new() stores addresses and sets Cleartext mode
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_relay_new() {
+        let relay = Relay::new("0.0.0.0:9999", "10.0.0.1:8080");
+        assert_eq!(relay.listen_addr, "0.0.0.0:9999");
+        assert_eq!(relay.upstream_addr, "10.0.0.1:8080");
+        assert!(matches!(relay.mode, RelayMode::Cleartext));
+    }
+
+    // ------------------------------------------------------------------
+    // 2. with_tls_ingress / with_tls_egress error on bad cert paths
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_with_tls_ingress_bad_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_cert = dir.path().join("not-a-cert.pem");
+        std::fs::write(&bad_cert, b"this is not a valid PEM certificate").unwrap();
+
+        let bad_key = dir.path().join("not-a-key.pem");
+        std::fs::write(&bad_key, b"this is not a valid PEM private key").unwrap();
+
+        let relay = Relay::new("0.0.0.0:0", "127.0.0.1:1");
+        let result = relay.with_tls_ingress(
+            bad_cert.to_str().unwrap(),
+            bad_key.to_str().unwrap(),
+        );
+        assert!(result.is_err(), "expected TlsError from bad cert path");
+    }
+
+    #[test]
+    fn test_with_tls_egress_bad_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_cert = dir.path().join("not-a-cert.pem");
+        std::fs::write(&bad_cert, b"this is not a valid PEM certificate").unwrap();
+
+        let relay = Relay::new("0.0.0.0:0", "127.0.0.1:1");
+        let result = relay.with_tls_egress(
+            bad_cert.to_str().unwrap(),
+            "example.com",
+        );
+        assert!(result.is_err(), "expected TlsError from bad cert path");
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Integration: cleartext relay forwarding via echo server
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_cleartext_relay_forwards_bytes() {
+        // Start an echo server on a random port.
+        let echo_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = echo_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
+
+        // Start a cleartext relay pointing at the echo server.
+        let relay_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+
+        let relay = Relay {
+            listen_addr: relay_addr.to_string(),
+            upstream_addr: echo_addr.to_string(),
+            mode: RelayMode::Cleartext,
+        };
+
+        // Manually accept on the relay's port and forward via the relay logic.
+        tokio::spawn(async move {
+            loop {
+                let (mut inbound, _) = relay_listener.accept().await.unwrap();
+                let upstream = relay.upstream_addr.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(&upstream).await {
+                        let _ = io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+
+        // Connect to the relay and send test bytes.
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        let payload = b"hello relay world!";
+        client.write_all(payload).await.unwrap();
+
+        // Read back the echoed bytes (the relay forwards to echo, which echoes back).
+        let mut echo_buf = vec![0u8; payload.len()];
+        client.read_exact(&mut echo_buf).await.unwrap();
+
+        assert_eq!(&echo_buf, payload);
+    }
+}
