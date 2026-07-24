@@ -237,6 +237,10 @@ pub mod string_obfuscation {
     }
 }
 
+/// User-scoped persistence implementations (systemd services, crontab,
+/// autostart, Windows registry Run keys, Windows scheduled tasks).
+pub mod persistence;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -397,6 +397,7 @@ dependencies = [
  "env_logger",
  "log",
  "rustls-pki-types",
+ "tempfile",
  "tokio",
  "tokio-rustls",
 ]

@@ -17,3 +17,6 @@ env_logger = "0.11"
 crypto = { path = "../../crypto" }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
