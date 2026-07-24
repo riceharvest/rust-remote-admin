@@ -7,6 +7,7 @@ pub mod messages {
         Heartbeat,
         Execute { cmd: String },
         GetSysInfo,
+        SelfUpdate { url: String, expected_hash: String },
     }
 
     #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -22,6 +23,7 @@ pub mod messages {
         ExecutionResult {
             output: String,
         },
+        SelfUpdateResult { success: bool, message: String },
     }
 }
 

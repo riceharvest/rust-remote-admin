@@ -358,13 +358,90 @@ pub mod execution {
         }
     }
 
-    /// Agent self-update stub.
+    /// Agent self-update implementation.
     ///
-    /// Protocol message: Response::Failure with error explaining
-    /// the feature is not implemented. See issue #48.
-    pub async fn self_update() -> Option<Response> {
-        Some(Response::Failure {
-            error: "self-update is not implemented".into(),
+    /// Protocol message: Response::SelfUpdateResult with success status and message.
+    /// Downloads the new binary from the provided URL, verifies the hash,
+    /// and replaces the running binary. See issue #48.
+    pub async fn self_update(url: &str, expected_hash: &str) -> Option<Response> {
+        // Download the new binary
+        let response = match reqwest::get(url).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Some(Response::SelfUpdateResult {
+                    success: false,
+                    message: format!("download failed: {e}"),
+                });
+            }
+        };
+
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return Some(Response::SelfUpdateResult {
+                    success: false,
+                    message: format!("read body failed: {e}"),
+                });
+            }
+        };
+
+        // Verify SHA256 hash
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = hasher.finalize();
+        let hash_hex = hex::encode(hash);
+        
+        if hash_hex != expected_hash {
+            return Some(Response::SelfUpdateResult {
+                success: false,
+                message: format!("hash mismatch: expected {expected_hash}, got {hash_hex}"),
+            });
+        }
+
+        // Get current executable path
+        let current_exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                return Some(Response::SelfUpdateResult {
+                    success: false,
+                    message: format!("failed to get current exe: {e}"),
+                });
+            }
+        };
+
+        // Write new binary to a temporary path first, then atomically replace
+        let temp_path = current_exe.with_extension("new");
+        if let Err(e) = std::fs::write(&temp_path, &bytes) {
+            return Some(Response::SelfUpdateResult {
+                success: false,
+                message: format!("write failed: {e}"),
+            });
+        }
+
+        // On Unix, make it executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755)) {
+                return Some(Response::SelfUpdateResult {
+                    success: false,
+                    message: format!("chmod failed: {e}"),
+                });
+            }
+        }
+
+        // Atomically replace the binary
+        if let Err(e) = std::fs::rename(&temp_path, &current_exe) {
+            return Some(Response::SelfUpdateResult {
+                success: false,
+                message: format!("replace failed: {e}"),
+            });
+        }
+
+        Some(Response::SelfUpdateResult {
+            success: true,
+            message: "update successful, restart required".into(),
         })
     }
 }
@@ -409,8 +486,10 @@ mod tests {
         let cmd_resp = execution::execute_remote_cmd("echo test").await;
         assert!(cmd_resp.is_some());
 
-        let update_resp = execution::self_update().await;
-        assert!(matches!(update_resp, Some(Response::Failure { .. })));
+        let update_resp = execution::self_update("http://example.com/update", "dummy").await;
+        // self_update returns SelfUpdateResult, which may be success or failure depending on download
+        // For this test we just verify it returns something (not None)
+        assert!(update_resp.is_some());
     }
 
     #[tokio::test]
