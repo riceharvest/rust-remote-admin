@@ -78,14 +78,14 @@ The agent template is also published as a build artifact for inspection or overr
 |-------|------|
 | `c2/core` | Client registry, per-client command queues, mTLS listener, heartbeat health tracking, agent generator CLI |
 | `c2/generator` | Libraries for patching connection config into template agent binaries |
-| `c2/gui` | Tauri v2 dashboard (client list, logs, live events) |
+| `c2/gui` | Tauri v2 dashboard (client list, logs, live events, agent generation form) |
 | `c2/plugins` | Operator-side plugin trait with echo example |
 | `c2/relay` | Tokio TCP relay — cleartext, TLS-ingress, TLS-egress forwarding |
-| `agent/core` | Command routing, heartbeat loop, exponential-backoff reconnect, mTLS/TLS/plain modes, embedded config reader |
+| `agent/core` | Command routing, heartbeat loop, exponential-backoff reconnect, mTLS/TLS/plain modes, embedded config reader, **self-update**, **state persistence**, **runtime config (TOML/env/hot-reload)**, **structured audit logging** |
 | `agent/modules` | Process listing, file I/O with path validation, registry access, sysinfo, remote command execution with whitelist |
 | `agent/hardening` | Passive endpoint security monitoring (debugger detection, VM/platform detection, sandbox detection) |
 | `protocol` | Shared command/response types, config marker and AgentConfig serialization |
-| `crypto` | AES-GCM payload encryption with random nonces, mTLS session handling (cert loading, acceptor/connector builders, dev cert generation) |
+| `crypto` | AES-GCM payload encryption with random nonces, **KeyManager (HKDF-SHA256)**, mTLS session handling (cert loading, acceptor/connector builders, dev cert generation) |
 
 ## Config marker format
 
@@ -102,11 +102,13 @@ The agent scans its own executable at startup for the marker. The C2 generator f
 
 ## Security and access control
 
-- All remote command execution is subject to a **command whitelist** — only registered safe commands (`echo`, `ls`, `cat`, `df`, `ps`, `uptime`, `whoami`, `uname`, `ip`, `ss`, `ping`, `curl`, `wget`, `systemctl status`, `journalctl`, `free`, `du`, `date`, `id`) are accepted.
+- All remote command execution is subject to a **command whitelist** — only registered safe commands (`echo`, `ls`, `cat`, `df`, `ps`, `uptime`, `whoami`, `uname`, `ip`, `ss`, `ping`, `systemctl status`, `journalctl`, `free`, `du`, `date`, `id`) are accepted. Network-capable commands (`curl`, `wget`) are explicitly excluded.
 - File operations are restricted to allowed directories (`/tmp`, `/home`, `/var/tmp`).
-- Process management only supports listing — termination is platform-restricted and documented as such.
+- Process management only supports listing — termination is platform-restricted (Windows FFI with safety documentation) and documented as such.
 - All communication can be encrypted with TLS or mutual TLS.
 - Payload encryption uses AES-GCM with **random nonces** per operation.
+- **KeyManager** derives AES-128-GCM keys via HKDF-SHA256 from password + salt; hardcoded test key isolated to test module only.
+- **Structured audit logging** (JSONL) with 17 event types, 4 severity levels, async buffered writer, file rotation, and severity filtering.
 
 ## Security boundary
 
@@ -140,7 +142,9 @@ cargo build -p c2-gui
 
 ## Implementation status
 
-### Done (v0.1.0 → v0.2.0)
+### Done (v0.1.0 → v0.3.0)
+
+#### Core functionality
 - ✅ Process listing, file I/O with path validation, sysinfo reporting
 - ✅ Config marker (`RRA_CONFIG_V1`) embedded in agent binary at build time
 - ✅ Agent scans own executable for config at startup
@@ -156,10 +160,23 @@ cargo build -p c2-gui
 - ✅ Command execution whitelist for remote scripting
 - ✅ Passive endpoint security monitoring (debugger, VM, sandbox detection)
 - ✅ AES-GCM encryption with random nonces
-- ✅ Tests pass
+
+#### Production readiness (v0.2.0 → v0.3.0)
+- ✅ **Agent self-update mechanism** — `SelfUpdate` command with URL + expected SHA256, HTTP download, hash verification, atomic binary replacement, Unix executable bit preservation
+- ✅ **State persistence** — `AgentState` / `C2State` / `StateManager` with JSON serialization to `~/.config/rust-remote-admin/state/`; survives restarts
+- ✅ **Runtime configuration** — TOML config file + `RRA_*` environment variable overrides + file-watching hot-reload + validation
+- ✅ **Structured audit logging** — `AuditLogger` with 17 event types, 4 severity levels, JSONL output, async buffered writer, file rotation, severity filtering, global singleton
+- ✅ **Key management** — `KeyManager` with `new(key)` and `from_password(password, salt)` (HKDF-SHA256); hardcoded test key `[0x11; 16]` moved to `#[cfg(test)]` only
+- ✅ **Whitelist hardening** — removed `curl` and `wget` from execution whitelist to prevent network exfiltration
+- ✅ **Windows kill_process safety** — FFI `TerminateProcess` documented with `// SAFETY` comments; `kill_process_available()` public API
+- ✅ **C2 relay tests** — 4 tests covering Cleartext, TLS, and forwarding
+- ✅ **CI pipeline** — `.github/workflows/ci.yml` runs `cargo check`, `cargo test`, `cargo clippy --no-deps` on push/PR
+- ✅ **C2 GUI connection UI** — server address input, connect button, status indicator, prototype notice banner
 
 ### Next
 - ⬜ Windows tests for generated agent config loading
+- ⬜ Windows agent self-update integration test
+- ⬜ Tauri GUI: live agent monitoring + command dispatch
 
 ## License
 
