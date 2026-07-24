@@ -11,7 +11,21 @@
         <h1 id="title">C2 Dashboard</h1>
     </header>
     <main>
+        <!-- Prototype notice banner -->
+        <div id="prototype-notice">
+            <strong>⚠ Prototype UI</strong> — Command dispatch and live agent monitoring are done
+            via the CLI (<code>rust-remote-admin-c2</code> server).
+        </div>
         <div class="dashboard-grid">
+            <section id="connection">
+                <h2 id="conn_title">C2 Server Connection</h2>
+                <div class="field-row">
+                    <label for="c2-server-address">Server Address:</label>
+                    <input type="text" id="c2-server-address" placeholder="e.g. 10.0.0.1:9000">
+                    <button id="connect-btn">Connect</button>
+                </div>
+                <div id="connection-status" class="status-disconnected">Not connected</div>
+            </section>
             <section id="controls">
                 <h2 id="gen_title">Generate Agent</h2>
                 <div class="field-row">
@@ -155,6 +169,38 @@
         });
 
         init();
+
+        // Connection UI
+        const connectBtn = document.getElementById('connect-btn');
+        const serverAddress = document.getElementById('c2-server-address');
+        const connStatus = document.getElementById('connection-status');
+
+        connectBtn.addEventListener('click', async () => {
+            const address = serverAddress.value.trim();
+            if (!address) return;
+
+            connectBtn.disabled = true;
+            connectBtn.textContent = 'Connecting...';
+
+            try {
+                const res = await invoke('connect_to_c2', { address });
+                if (res.success) {
+                    connStatus.className = 'status-connected';
+                    connStatus.textContent = `✓ Connected to ${address}`;
+                    serverAddress.disabled = true;
+                } else {
+                    connStatus.className = 'status-disconnected';
+                    connStatus.textContent = `✗ ${res.message}`;
+                }
+                updateLogs();
+            } catch (err) {
+                connStatus.className = 'status-disconnected';
+                connStatus.textContent = `✗ ${err}`;
+            } finally {
+                connectBtn.disabled = false;
+                connectBtn.textContent = 'Connect';
+            }
+        });
     </script>
 </body>
 </html>

@@ -110,6 +110,60 @@ button:disabled {
     grid-column: 1 / -1;
 }
 
+#prototype-notice {
+    background: #2d1b1b;
+    border: 1px solid #e94560;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: #ffb3b3;
+    line-height: 1.5;
+}
+
+#prototype-notice code {
+    background: #1a1a2e;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 12px;
+}
+
+#connection {
+    grid-column: 1 / -1;
+}
+
+#connection .field-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+#connection .field-row input {
+    flex: 1;
+    max-width: 300px;
+}
+
+#connection-status {
+    margin-top: 8px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.status-connected {
+    color: #3fb950;
+    background: #0d2817;
+    border: 1px solid #3fb950;
+}
+
+.status-disconnected {
+    color: #f85149;
+    background: #2d1111;
+    border: 1px solid #f85149;
+}
+
 #client-list {
     list-style: none;
     margin-bottom: 8px;

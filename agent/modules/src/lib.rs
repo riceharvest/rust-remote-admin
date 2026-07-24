@@ -58,6 +58,15 @@ pub mod process_manager {
         };
         #[cfg(windows)]
         {
+            // # Safety
+            //
+            // This block calls `TerminateProcess` through the windows crate's FFI bindings.
+            // The process handle obtained via `OpenProcess` must have `PROCESS_TERMINATE` access
+            // rights. This is a forceful termination — the target process receives no chance to
+            // clean up (no DLL main notifications, no finally blocks, no destructors run).
+            //
+            // Prefer `kill_process_posix` and its signal-based approach on platforms where both
+            // are available. On Windows this is the only direct termination path.
             unsafe {
                 let handle = windows::Win32::System::Threading::OpenProcess(
                     windows::Win32::System::Threading::PROCESS_TERMINATE,
@@ -65,6 +74,10 @@ pub mod process_manager {
                     pid,
                 );
                 if let Ok(handle) = handle {
+                    // SAFETY: The handle was obtained from `OpenProcess` with `PROCESS_TERMINATE`
+                    // access, and the PID was validated by the caller (parsed from a `u32`). The
+                    // handle is non-null at this point since `OpenProcess` returned `Ok`.
+                    // `CloseHandle` is called immediately after to prevent handle leaks.
                     let result = windows::Win32::System::Threading::TerminateProcess(handle, 1);
                     let _ = windows::Win32::Foundation::CloseHandle(handle);
                     if result.is_ok() {

