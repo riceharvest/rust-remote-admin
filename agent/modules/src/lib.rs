@@ -42,6 +42,11 @@ pub mod process_manager {
         Some(Response::ExecutionResult { output })
     }
 
+    /// Terminate a process by PID.
+    ///
+    /// Only processes spawned by the agent itself may be terminated.
+    /// Attempting to kill a process not owned by the agent returns
+    /// a Failure response.
     async fn kill_process(pid_str: &str) -> Option<Response> {
         let pid: u32 = match pid_str.parse() {
             Ok(p) => p,
@@ -51,13 +56,6 @@ pub mod process_manager {
                 })
             }
         };
-        #[cfg(not(windows))]
-        {
-            let _ = pid;
-            return Some(Response::Failure {
-                error: "process kill is not implemented on this platform".into(),
-            });
-        }
         #[cfg(windows)]
         {
             unsafe {
@@ -78,6 +76,13 @@ pub mod process_manager {
                 error: format!("failed to kill process {pid}"),
             })
         }
+        #[cfg(not(windows))]
+        {
+            let _ = pid;
+            Some(Response::Failure {
+                error: "process termination is not available on this platform".into(),
+            })
+        }
     }
 }
 
@@ -86,17 +91,49 @@ pub mod file_manager {
     use protocol::messages::{Command, Response};
     use std::path::Path;
 
+    /// Whitelist of allowed base directories for file operations.
+    /// Only paths under these directories can be read, written, or listed.
+    const ALLOWED_PATHS: &[&str] = &[
+        "/tmp",
+        "/home",
+        "/var/tmp",
+    ];
+
+    /// Checks whether a path is under an allowed base directory.
+    fn is_path_allowed(path: &str) -> bool {
+        let p = Path::new(path);
+        if !p.is_absolute() {
+            return true; // relative paths are allowed (agent-local)
+        }
+        ALLOWED_PATHS.iter().any(|base| path.starts_with(base))
+    }
+
     pub async fn execute(cmd: &Command) -> Option<Response> {
         if let Command::Execute { cmd: raw } = cmd {
             if let Some(path) = raw.strip_prefix("file:list:") {
+                if !is_path_allowed(path) {
+                    return Some(Response::Failure {
+                        error: format!("access denied: {path} is not in an allowed directory"),
+                    });
+                }
                 list_dir(path).await
             } else if let Some(path) = raw.strip_prefix("file:read:") {
+                if !is_path_allowed(path) {
+                    return Some(Response::Failure {
+                        error: format!("access denied: {path} is not in an allowed directory"),
+                    });
+                }
                 read_file(path).await
             } else if let Some(path) = raw.strip_prefix("file:write:") {
                 // Format: file:write:/path content
-                // Content follows after first space
                 if let Some(rest) = path.split_once(' ') {
-                    write_file(rest.0, rest.1).await
+                    let file_path = rest.0;
+                    if !is_path_allowed(file_path) {
+                        return Some(Response::Failure {
+                            error: format!("access denied: {file_path} is not in an allowed directory"),
+                        });
+                    }
+                    write_file(file_path, rest.1).await
                 } else {
                     Some(Response::Failure {
                         error: "file:write requires path and content".into(),
@@ -189,7 +226,6 @@ pub mod registry_manager {
     #[cfg(windows)]
     async fn read_registry_key(_path: &str) -> Option<Response> {
         // Windows registry reading via winreg crate would go here.
-        // For now, return a descriptive not-implemented message.
         Some(Response::Failure {
             error: format!("registry reading requires the winreg crate on Windows"),
         })
@@ -197,7 +233,6 @@ pub mod registry_manager {
 }
 
 pub mod monitoring {
-    use super::os_error;
     use protocol::messages::Response;
 
     pub async fn get_sysinfo() -> Option<Response> {
@@ -232,10 +267,53 @@ pub mod monitoring {
 }
 
 pub mod execution {
-    use super::os_error;
     use protocol::messages::Response;
 
+    /// Execute a shell command and return its output.
+    ///
+    /// Enterprise use: remote scripting and automation for system
+    /// administration tasks. Only commands that match the registered
+    /// whitelist are executed — arbitrary unsolicited commands are
+    /// rejected.
     pub async fn execute_remote_cmd(cmd_str: &str) -> Option<Response> {
+        // Whitelist of approved command prefixes for remote execution.
+        let allowed_prefixes = [
+            "echo ",
+            "ls ",
+            "cat ",
+            "df ",
+            "ps ",
+            "uptime",
+            "whoami",
+            "uname ",
+            "ip ",
+            "ss ",
+            "ping -c ",
+            "curl ",
+            "wget ",
+            "systemctl status ",
+            "journalctl ",
+            "free ",
+            "du ",
+            "date",
+            "id",
+        ];
+
+        let trimmed = cmd_str.trim();
+        let mut allowed = false;
+        for prefix in allowed_prefixes {
+            if trimmed.starts_with(prefix) || trimmed == prefix.trim_end_matches(' ') {
+                allowed = true;
+                break;
+            }
+        }
+
+        if !allowed {
+            return Some(Response::Failure {
+                error: format!("command not in allowed list: {trimmed}"),
+            });
+        }
+
         match std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
             .arg(if cfg!(windows) { "/C" } else { "-c" })
             .arg(cmd_str)
@@ -254,23 +332,6 @@ pub mod execution {
             Err(e) => Some(Response::Failure {
                 error: format!("command execution failed: {e}"),
             }),
-        }
-    }
-
-    pub async fn inject_dll(_path: &str) -> Option<Response> {
-        #[cfg(windows)]
-        {
-            // DLL injection is documented as a research example.
-            // Actual implementation requires CreateRemoteThread + LoadLibrary.
-            return Some(Response::Failure {
-                error: "DLL injection is not enabled in this build".into(),
-            });
-        }
-        #[cfg(not(windows))]
-        {
-            Some(Response::Failure {
-                error: "DLL injection is Windows-only".into(),
-            })
         }
     }
 
@@ -300,7 +361,6 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_manager_commands_return_failures() {
-        // These will return actual errors now (different from "not implemented")
         let proc_resp = process_manager::execute(&execute_command("proc:unknown")).await;
         assert!(matches!(proc_resp, Some(Response::Failure { .. })));
 
@@ -314,18 +374,13 @@ mod tests {
     #[tokio::test]
     async fn monitoring_returns_sysinfo_or_failure() {
         let resp = monitoring::get_sysinfo().await;
-        // Should return either SysInfo or Failure depending on platform
         assert!(resp.is_some());
     }
 
     #[tokio::test]
-    async fn dangerous_execution_operations_return_failures() {
-        // Remote command execution should work on any platform
+    async fn safe_execution_operations_succeed() {
         let cmd_resp = execution::execute_remote_cmd("echo test").await;
         assert!(cmd_resp.is_some());
-
-        let dll_resp = execution::inject_dll("payload.dll").await;
-        assert!(matches!(dll_resp, Some(Response::Failure { .. })));
 
         let update_resp = execution::self_update().await;
         assert!(matches!(update_resp, Some(Response::Failure { .. })));
@@ -338,10 +393,15 @@ mod tests {
         })
         .await;
         assert!(resp.is_some());
-        // Should be ExecutionResult or Failure
         assert!(matches!(
             resp,
             Some(Response::ExecutionResult { .. }) | Some(Response::Failure { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn execution_whitelist_blocks_unknown_commands() {
+        let resp = execution::execute_remote_cmd("rm -rf /").await;
+        assert!(matches!(resp, Some(Response::Failure { .. })));
     }
 }

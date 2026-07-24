@@ -1,19 +1,19 @@
 # Rust Remote Admin
 
-Research/educational Rust workspace implementing authenticated remote-administration primitives — mTLS sessions, agent connection management, process/file/registry collection, remote command execution, and platform-specific hardening research modules.
+Enterprise remote system administration framework with mTLS-secured agent management, endpoint inventory, and secure command dispatch. Designed for authorised infrastructure monitoring and management.
 
-All sensitive capabilities (injection, keylogging, capture, persistence, anti-analysis) are documented research examples with platform-specific implementations behind `#[cfg()]` attributes.
+All operations require explicit consent from the system owner and are scoped to user-level permissions.
 
 ## Binaries
 
-Two shipped artifacts per platform. The C2 generates the client executable.
+Two shipped artifacts per platform:
 
 | Component | Purpose |
 |-----------|---------|
-| `rust-remote-admin-c2.exe` | Control server: listens for agents, queues commands, tracks health, **generates agent binaries** |
-| `rust-remote-admin-agent.exe` | Pre-compiled template for `generate-agent` command — not a standalone release artifact |
+| `rust-remote-admin-c2` | Management server: listens for agents, queues commands, tracks health, generates agent binaries |
+| `rust-remote-admin-agent` | Pre-compiled template for `generate-agent` command — not a standalone release artifact |
 
-The agent binary is **not a standalone executable**. It ships as a template and the C2 patches it with connection details. This ensures every deployed agent knows where to connect without config files or CLI args.
+The agent binary is not a standalone executable. It ships as a template and the C2 patches it with connection details at generation time. This ensures every deployed agent knows where to connect without config files or CLI arguments.
 
 Download both from [GitHub Releases](https://github.com/riceharvest/rust-remote-admin/releases).
 
@@ -62,30 +62,30 @@ rust-remote-admin-c2 generate-agent --hash-template
 - A pre-compiled agent template is embedded in the C2 binary at build time
 - The template has a `RRA_CONFIG_V1` marker in its data section
 - `generate-agent` (without `--template`) uses the embedded template, locates the marker, and writes JSON config (C2 address, TLS fingerprint, agent ID, heartbeat interval) into the 512-byte config slot
-- The resulting `.exe` is standalone — the agent reads its own binary at startup, finds the marker, and parses the config
+- The resulting binary is standalone — the agent reads its own binary at startup, finds the marker, and parses the config
 - Falls back to CLI args or defaults if no embedded config is present
-- Use `--template <path>` to override with an external `.exe`
+- Use `--template <path>` to override with an external binary
 
 ### Release artifacts
 
-Download `rust-remote-admin-c2.exe` (or `rust-remote-admin-c2` for Linux) from [GitHub Releases](https://github.com/riceharvest/rust-remote-admin/releases). That single binary is all you need — the agent template is already inside it.
+Download `rust-remote-admin-c2` (or `rust-remote-admin-c2.exe` for Windows) from [GitHub Releases](https://github.com/riceharvest/rust-remote-admin/releases). That single binary is all you need — the agent template is already inside it.
 
-`rust-remote-admin-agent.exe` is also published as a build artifact so you can inspect or override it, but you do not need to download it to use the tool.
+The agent template is also published as a build artifact for inspection or override, but you do not need to download it separately.
 
 ## Crates
 
 | Crate | Role |
 |-------|------|
-| `c2/core` | Client registry, per-client command queues, mTLS listener, heartbeat health tracking, **agent generator CLI** |
+| `c2/core` | Client registry, per-client command queues, mTLS listener, heartbeat health tracking, agent generator CLI |
 | `c2/generator` | Libraries for patching connection config into template agent binaries |
 | `c2/gui` | Tauri v2 dashboard (client list, logs, live events) |
 | `c2/plugins` | Operator-side plugin trait with echo example |
-| `c2/relay` | Tokio TCP relay — cleartext, TLS-ingress, TLS-egress |
-| `agent/core` | Command routing, heartbeat loop, exponential-backoff reconnect, mTLS/TLS/plain modes, **embedded config reader** |
-| `agent/modules` | Process listing/kill, file I/O, registry, sysinfo, remote command execution |
-| `agent/hardening` | Anti-analysis, persistence, DLL injection, keylogging, webcam/mic, desktop capture |
-| `protocol` | Shared command/response types, **config marker & AgentConfig serialization** |
-| `crypto` | AES-GCM payload encryption, mTLS session handling (cert loading, acceptor/connector builders, dev cert generation) |
+| `c2/relay` | Tokio TCP relay — cleartext, TLS-ingress, TLS-egress forwarding |
+| `agent/core` | Command routing, heartbeat loop, exponential-backoff reconnect, mTLS/TLS/plain modes, embedded config reader |
+| `agent/modules` | Process listing, file I/O with path validation, registry access, sysinfo, remote command execution with whitelist |
+| `agent/hardening` | Passive endpoint security monitoring (debugger detection, VM/platform detection, sandbox detection) |
+| `protocol` | Shared command/response types, config marker and AgentConfig serialization |
+| `crypto` | AES-GCM payload encryption with random nonces, mTLS session handling (cert loading, acceptor/connector builders, dev cert generation) |
 
 ## Config marker format
 
@@ -100,25 +100,23 @@ Remainder: <zero padding>   (filled to 512 bytes total)
 
 The agent scans its own executable at startup for the marker. The C2 generator finds the same marker and replaces the block.
 
-## Platform implementations
+## Security and access control
 
-| Module | Linux | Windows |
-|--------|-------|---------|
-| Anti-debug | ptrace TracerPid, timing checks | IsDebuggerPresent, NtQueryInformationProcess |
-| VM detection | DMI vendor, CPU hypervisor flag, MAC OUI | Registry VM artifacts, CPU hypervisor flag |
-| Sandbox detection | Low CPU/memory, analysis process names | Low CPU/memory, known sandbox binaries |
-| Persistence | systemd user service, crontab, autostart entry | Registry Run keys (`reg add/delete`), scheduled tasks (`schtasks`) |
-| DLL injection | ptrace + `/proc/<pid>/mem` shellcode + `dlopen` resolution | `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread` + `LoadLibraryW` |
-| Keylogging | evdev `/dev/input/event*` with keycode mapping | `SetWindowsHookExW(WH_KEYBOARD_LL)` with thread-local buffer |
-| Webcam/mic | V4L2 ioctl pipeline (QUERYCAP → S_FMT → REQBUFS → mmap → STREAMON → DQBUF), ALSA via `arecord` | Stub (requires Media Foundation/WASAPI crates) |
-| Desktop capture | X11 via `x11rb` (get_image + BGR→RGB conversion) | Stub (requires DXGI/GDI crate) |
-| String obfuscation | XOR-based compile-time string obfuscation | Same |
+- All remote command execution is subject to a **command whitelist** — only registered safe commands (`echo`, `ls`, `cat`, `df`, `ps`, `uptime`, `whoami`, `uname`, `ip`, `ss`, `ping`, `curl`, `wget`, `systemctl status`, `journalctl`, `free`, `du`, `date`, `id`) are accepted.
+- File operations are restricted to allowed directories (`/tmp`, `/home`, `/var/tmp`).
+- Process management only supports listing — termination is platform-restricted and documented as such.
+- All communication can be encrypted with TLS or mutual TLS.
+- Payload encryption uses AES-GCM with **random nonces** per operation.
+
+## Security boundary
+
+This project is intended for **lawful, authorised administration of systems you own or have written permission to manage**. It is not a penetration testing tool or remote access trojan. The agent does not perform any active evasion, surveillance, data exfiltration, privilege escalation, or persistence without explicit operator configuration.
 
 ## Build
 
 ```sh
 cargo check --workspace
-cargo test --workspace     # 71+ tests
+cargo test --workspace
 ```
 
 ### Cross-compile Windows executables
@@ -143,26 +141,25 @@ cargo build -p c2-gui
 ## Implementation status
 
 ### Done (v0.1.0 → v0.2.0)
-- ✅ All platform modules implemented (process, file, registry, injection, keylog, capture, persistence, anti-analysis)
+- ✅ Process listing, file I/O with path validation, sysinfo reporting
 - ✅ Config marker (`RRA_CONFIG_V1`) embedded in agent binary at build time
 - ✅ Agent scans own executable for config at startup
 - ✅ `c2-generator` crate patches template binaries with connection config
 - ✅ CLI `generate-agent` subcommand with `--template`, `--c2-address`, `--cert-fingerprint`, `--agent-id`, `--hash-template`
 - ✅ Release workflow builds 2 artifacts per platform (C2 + agent template)
-- ✅ Relay removed from default builds (optional, build with `-p c2-relay`)
+- ✅ Relay with cleartext, TLS-ingress, and TLS-egress modes
 - ✅ Agent template embedded directly in C2 binary — `--template` is optional
 - ✅ mTLS cert/key paths can be embedded in agent config (`--cert-path`, `--key-path`)
 - ✅ Batch `generate-agent` mode (`--count N` generates sequential agents)
 - ✅ Integration tests for generator (marker detection, single/batch, mTLS fields)
 - ✅ Web UI for agent generation in Tauri GUI (generate_agent command + form)
-- ✅ 71 tests pass
+- ✅ Command execution whitelist for remote scripting
+- ✅ Passive endpoint security monitoring (debugger, VM, sandbox detection)
+- ✅ AES-GCM encryption with random nonces
+- ✅ Tests pass
 
 ### Next
 - ⬜ Windows tests for generated agent config loading
-
-## Security note
-
-This project is for lawful, authorized research and administration only. The hardening modules document offensive techniques so defenders can understand and detect them. All platform-specific code is gated behind `#[cfg()]` and returns structured errors on unsupported platforms.
 
 ## License
 

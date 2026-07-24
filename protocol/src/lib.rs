@@ -7,9 +7,6 @@ pub mod messages {
         Heartbeat,
         Execute { cmd: String },
         GetSysInfo,
-        StartRD { quality: u8 },
-        InputEvent { key: String, x: i32, y: i32 },
-        Custom(u32, Vec<u8>),
     }
 
     #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -24,16 +21,5 @@ pub mod messages {
         ExecutionResult {
             output: String,
         },
-        Frame {
-            data: Vec<u8>,
-        },
-    }
-
-    #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-    pub struct AgentEvent {
-        pub timestamp: u64,
-        pub source_id: u32,
-        pub event_type: String,
-        pub payload: Vec<u8>,
     }
 }

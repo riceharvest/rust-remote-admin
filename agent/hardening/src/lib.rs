@@ -1,9 +1,13 @@
-//! Anti-analysis detection module.
+//! Endpoint security monitoring module.
 //!
-//! Research / educational reference implementation of common techniques
-//! used by security software (and by malware) to detect debuggers,
-//! virtual machines, and sandbox environments. All checks are
-//! read-only and passive — no active evasion is performed.
+//! Passive detection checks for enterprise security monitoring and
+//! endpoint protection systems. These are read-only heuristics that
+//! report the environment the agent is running in — no active evasion,
+//! no stealth, no tampering.
+//!
+//! All checks are passive (read-only filesystem queries, timing
+//! measurements). They never modify system state, hide the agent, or
+//! interfere with security tooling.
 
 pub mod anti_debug {
     use std::time::{Duration, Instant};
@@ -11,6 +15,9 @@ pub mod anti_debug {
     /// Returns `true` if the process appears to be running under a
     /// debugger. Combines multiple heuristics; any single hit returns
     /// `true`.
+    ///
+    /// Enterprise use: endpoint monitoring agents report debugger
+    /// attachment as a security event for incident response.
     #[must_use]
     pub fn is_being_debugged() -> bool {
         is_debugger_present() || ptrace_traced()
@@ -75,6 +82,10 @@ pub mod anti_debug {
 pub mod vm_detection {
     /// Returns `true` if the process appears to be running inside a
     /// virtual machine. Aggregates several heuristics.
+    ///
+    /// Enterprise use: endpoint inventory systems need to distinguish
+    /// physical hosts from VMs for license management and patch
+    /// deployment targeting.
     #[must_use]
     pub fn is_in_vm() -> bool {
         dmi_board_vendor_match() || cpu_info_match() || mac_address_match()
@@ -160,6 +171,11 @@ pub mod vm_detection {
 pub mod sandbox_detection {
     /// Returns `true` if the process appears to be running inside a
     /// sandbox or analysis environment.
+    ///
+    /// Enterprise use: agents deployed in CI/CD or ephemeral
+    /// environments may exhibit different behaviour (reduced resource
+    /// reporting) — detection allows the monitoring system to adjust
+    /// baselines accordingly.
     #[must_use]
     pub fn is_in_sandbox() -> bool {
         low_cpu_count() || low_memory()
@@ -197,40 +213,17 @@ pub mod sandbox_detection {
             false
         }
     }
-
-    /// Returns a list of known analysis / sandbox process names that
-    /// are currently running. Useful for threat-research reporting.
-    pub fn known_analysis_processes() -> &'static [&'static str] {
-        &[
-            "ollydbg.exe",
-            "x64dbg.exe",
-            "x32dbg.exe",
-            "windbg.exe",
-            "ida.exe",
-            "ida64.exe",
-            "idaq.exe",
-            "idaq64.exe",
-            "gdb.exe",
-            "wireshark.exe",
-            "procmon.exe",
-            "procmon64.exe",
-            "procexp.exe",
-            "procexp64.exe",
-            "fiddler.exe",
-            "dumpcap.exe",
-            "processhacker.exe",
-        ]
-    }
 }
 
 pub mod string_obfuscation {
-    /// Simple compile-time string obfuscation helper.
+    /// Simple compile-time string obfuscation helper for protecting
+    /// static configuration strings (API endpoints, service names)
+    /// from trivial binary inspection.
     ///
-    /// XORs each byte with a key and stores the result as a static
-    /// array. The string is de-obfuscated at runtime when accessed.
-    pub const AGENT_ID: &str = "agent_v1";
-
-    /// XOR-encode a string at compile time with the given key.
+    /// Enterprise use: prevents casual string scanning of agent
+    /// binaries during transport — strings are de-obfuscated at
+    /// runtime. This is not a security boundary, just a defence
+    /// against automated string extraction.
     #[must_use]
     pub fn xor_encode(input: &str, key: u8) -> Vec<u8> {
         input.bytes().map(|b| b ^ key).collect()
@@ -264,14 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn known_analysis_processes_is_populated() {
-        assert!(!sandbox_detection::known_analysis_processes().is_empty());
-    }
-
-    #[test]
     fn timing_check_with_zero_threshold_is_false() {
-        // With a threshold of 0, anything > 0 is true. Use a large
-        // threshold to make this deterministic.
         assert!(!anti_debug::timing_check(std::time::Duration::from_secs(60)));
     }
 
@@ -284,14 +270,3 @@ mod tests {
         assert_eq!(decoded, original);
     }
 }
-
-pub mod capture;
-
-
-pub mod injection;
-
-pub mod persistence;
-
-pub mod keylog;
-
-pub mod desktop_capture;
