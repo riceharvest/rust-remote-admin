@@ -53,6 +53,7 @@ dependencies = [
  "env_logger",
  "hex",
  "log",
+ "once_cell",
  "protocol",
  "reqwest 0.12.28",
  "rustls-pki-types",

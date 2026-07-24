@@ -17,6 +17,9 @@ pub use persistence::{AgentState, C2State, StateManager};
 mod config;
 pub use config::{AgentConfig, C2Config, ConfigManager, LoggingConfig, RuntimeConfig, SecurityConfig};
 
+mod audit;
+pub use audit::{AuditConfig, AuditEntry, AuditEventType, AuditLogger, AuditSeverity, audit_log, global_audit, init_global_audit};
+
 /// Configuration for agent connection and reconnection.
 #[derive(Clone)]
 pub struct ConnectionConfig {
