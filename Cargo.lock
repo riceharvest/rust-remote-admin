@@ -62,6 +62,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "toml 0.8.2",
 ]
 
 [[package]]
