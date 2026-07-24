@@ -56,8 +56,10 @@ dependencies = [
  "protocol",
  "reqwest 0.12.28",
  "rustls-pki-types",
+ "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tokio-rustls",
 ]

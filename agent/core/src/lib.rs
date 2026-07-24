@@ -11,6 +11,9 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_rustls::TlsConnector;
 
+mod persistence;
+pub use persistence::{AgentState, C2State, StateManager};
+
 /// Configuration for agent connection and reconnection.
 #[derive(Clone)]
 pub struct ConnectionConfig {
