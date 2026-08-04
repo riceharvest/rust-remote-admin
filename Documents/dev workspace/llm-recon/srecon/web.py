@@ -141,6 +141,47 @@ PAGE = r"""<!DOCTYPE html>
   .xlink { cursor: pointer; color: var(--amber); text-decoration: underline; }
   .xlink:hover { color: var(--phos); }
   .snip { display: block; color: var(--phos-dim); font-size: 11px; white-space: pre-wrap; margin: 2px 0 6px 12px; }
+  /* trend chart */
+  .trend-chart { width: 100%; height: 160px; background: #000; border: 1px solid var(--line); margin-bottom: 12px; }
+  .trend-chart svg { width: 100%; height: 100%; display: block; }
+  .trend-bar { cursor: pointer; transition: opacity .15s; }
+  .trend-bar:hover { opacity: 0.7; }
+  .trend-legend { display: flex; gap: 16px; justify-content: center; margin-top: 6px; font-size: 10px; letter-spacing: .1em; }
+  .trend-legend span { display: flex; align-items: center; gap: 4px; }
+  .trend-legend .swatch { width: 12px; height: 8px; border-radius: 2px; }
+  /* diff modal */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.85); z-index: 100; display: none; }
+  .modal-overlay.open { display: block; }
+  .modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 900px; max-height: 80vh; background: var(--panel); border: 1px solid var(--line); z-index: 101; overflow: hidden; display: flex; flex-direction: column; }
+  .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); background: #0a120a; }
+  .modal-title { color: var(--amber); letter-spacing: .2em; font-size: 12px; }
+  .modal-close { background: none; border: 1px solid var(--line); color: var(--phos); padding: 4px 10px; font-size: 11px; }
+  .modal-close:hover { background: var(--red); color: #000; border-color: var(--red); }
+  .modal-body { overflow-y: auto; padding: 12px; flex: 1; }
+  .diff-section { margin-bottom: 20px; }
+  .diff-section h4 { color: var(--amber); font-size: 11px; letter-spacing: .15em; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .diff-count { color: var(--phos-dim); font-weight: normal; }
+  .diff-list { max-height: 220px; overflow-y: auto; font-size: 11px; }
+  .diff-item { border: 1px solid var(--line); padding: 6px 8px; margin-bottom: 4px; background: #020502; }
+  .diff-item .target { color: var(--phos); font-weight: bold; }
+  .diff-item .change { color: var(--amber); font-size: 10.5px; margin-top: 2px; }
+  .diff-item .change .from { color: var(--red); }
+  .diff-item .change .to { color: var(--phos); }
+  .diff-item .change .unknown { color: var(--phos-dim); }
+  /* retarget buttons in intel panels */
+  .retarget-btn { margin-left: 8px; padding: 1px 8px; font-size: 10px; border-color: var(--amber); color: var(--amber); background: transparent; }
+  .retarget-btn:hover { background: var(--amber); color: #000; }
+  /* verify badge */
+  .verify-badge { display: inline-block; padding: 1px 6px; font-size: 9.5px; letter-spacing: .1em; border-radius: 3px; margin-left: 6px; vertical-align: middle; }
+  .verify-live { background: #1a3a1a; border: 1px solid var(--phos); color: var(--phos); }
+  .verify-auth-walled { background: #3a2a0a; border: 1px solid var(--amber); color: var(--amber); }
+  .verify-honeypot { background: #3a0a0a; border: 1px solid var(--red); color: var(--red); }
+  .verify-timeout, .verify-error { background: #2a1a3a; border: 1px solid #8844aa; color: #bb88ee; }
+  .verify-skipped, .verify-none { background: #1a1a1a; border: 1px solid #444; color: #888; }
+  /* score tooltip */
+  .score-cell { position: relative; cursor: help; }
+  .score-tooltip { display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #0a120a; border: 1px solid var(--line); padding: 6px 8px; font-size: 10px; white-space: pre-wrap; z-index: 10; min-width: 180px; max-width: 300px; color: var(--phos-dim); pointer-events: none; margin-bottom: 4px; }
+  .score-cell:hover .score-tooltip { display: block; }
 </style>
 </head>
 <body class="adv">
@@ -344,9 +385,18 @@ PAGE = r"""<!DOCTYPE html>
 
   <div class="panel adv-only">
     <h2>&#9656; ARCHIVE &mdash; LAST 10 SCANS</h2>
-    <select id="hist" style="min-width:340px"></select>
-    <button id="hist-load" class="small">Load</button>
-    <button id="hist-refresh" class="small">Refresh List</button>
+    <div id="trend-chart" class="trend-chart" style="display:none"></div>
+    <div class="trend-legend" id="trend-legend" style="display:none"></div>
+    <div class="fltbox" style="margin-top:8px; gap:8px; flex-wrap:wrap">
+      <label>COMPARE A: <select id="diff-a" style="min-width:200px"><option value="">-- select scan --</option></select></label>
+      <label>COMPARE B: <select id="diff-b" style="min-width:200px"><option value="">-- select scan --</option></select></label>
+      <button id="diff-go" class="small">DIFF</button>
+    </div>
+    <div style="margin-top:8px">
+      <select id="hist" style="min-width:340px"></select>
+      <button id="hist-load" class="small">Load</button>
+      <button id="hist-refresh" class="small">Refresh List</button>
+    </div>
   </div>
 
   <div class="panel">
@@ -364,7 +414,7 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <table id="dtable">
         <thead><tr>
-          <th data-k="target">TARGET</th><th data-k="product">PRODUCT</th><th data-k="verdict">VERDICT</th>
+          <th data-k="target">TARGET</th><th data-k="product">PRODUCT</th><th data-k="verdict">VERDICT</th><th>VERIFY</th>
           <th data-k="version">VERSION</th><th>MODEL / INVENTORY</th><th data-k="ptr">PTR</th><th>ASN</th><th data-k="score">SCORE</th><th>FLAGS</th><th data-k="latency_ms">MS</th>
         </tr></thead>
         <tbody id="rows"></tbody>
@@ -376,6 +426,17 @@ PAGE = r"""<!DOCTYPE html>
 
   <div class="classif">TOP SECRET // SILICON // NOFORN</div>
 </div>
+
+<!-- diff modal -->
+<div class="modal-overlay" id="diff-modal-overlay"></div>
+<div class="modal" id="diff-modal" role="dialog" aria-modal="true" aria-labelledby="diff-modal-title">
+  <div class="modal-header">
+    <span class="modal-title" id="diff-modal-title">SCAN DIFF</span>
+    <button class="modal-close" id="diff-modal-close">CLOSE</button>
+  </div>
+  <div class="modal-body" id="diff-modal-body"></div>
+</div>
+
 <script>
 const PATHS = __PROBE_PATHS_JSON__;
 const RENDER_CAP = 1000;
@@ -1291,9 +1352,11 @@ def _db_scans():
                     "SELECT COUNT(*), "
                     "       COALESCE(SUM(verdict='GENUINE'),0), "
                     "       COALESCE(SUM(verdict='IMPOSTOR'),0), "
-                    "       COALESCE(SUM(verdict='UNKNOWN'),0) "
+                    "       COALESCE(SUM(verdict='UNKNOWN'),0), "
+                    "       COALESCE(SUM(verdict='DARK'),0), "
+                    "       COALESCE(SUM(verdict='ERROR'),0) "
                     "FROM targets WHERE scan_id=?", (sid,)).fetchone()
-                n, genuine, impostor, unknown = row
+                n, genuine, impostor, unknown, dark, error = row
                 started = s.get("started_at")
                 when = (time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(started))
                         if started else "")
@@ -1305,11 +1368,52 @@ def _db_scans():
                     "stats_json": s.get("stats_json"),
                     "total": n, "genuine": genuine,
                     "impostor": impostor, "unknown": unknown,
+                    "dark": dark, "error": error,
                 })
         finally:
             conn.close()
     except Exception:
         pass
+    return out
+
+
+def _db_scan_trend():
+    """Return per-scan verdict counts from scans.stats_json for trend chart.
+    Each entry: scan_id, finished_at, genuine, impostor, unknown, dark, error."""
+    try:
+        conn = sqlite3.connect(STATE_DB)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            rows = conn.execute(
+                "SELECT scan_id, finished_at, stats_json FROM scans "
+                "WHERE finished_at IS NOT NULL ORDER BY finished_at ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    out = []
+    for scan_id, finished_at, stats_json in rows:
+        verdicts = {"GENUINE": 0, "IMPOSTOR": 0, "UNKNOWN": 0, "DARK": 0, "ERROR": 0}
+        if stats_json:
+            try:
+                stats = json.loads(stats_json)
+                v = stats.get("verdicts")
+                if isinstance(v, dict):
+                    for k in verdicts:
+                        verdicts[k] = int(v.get(k, 0))
+            except Exception:
+                pass
+        out.append({
+            "scan_id": scan_id,
+            "finished_at": finished_at,
+            "finished_str": time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(finished_at)) if finished_at else "",
+            "genuine": verdicts["GENUINE"],
+            "impostor": verdicts["IMPOSTOR"],
+            "unknown": verdicts["UNKNOWN"],
+            "dark": verdicts["DARK"],
+            "error": verdicts["ERROR"],
+        })
     return out
 
 
@@ -1349,6 +1453,82 @@ def _db_results(scan_id):
             "flags": [], "ptr": None, "inventory_hash": None, "endpoints": {},
         })
     return out
+
+
+# ---------- diff logic (mirrors report.py classify_diff) ----------
+_RESULT_COLUMNS = [
+    "target", "verdict", "product", "version", "model", "models_served",
+    "score", "latency_ms", "verify_result", "verify_detail",
+    "asn", "as_name", "bgp_prefix", "net_type", "ptr", "flags", "error",
+]
+
+def _models_set(row):
+    """Model-set of a result row: sorted set from models_served, else the
+    single model field, else None (legacy row with no model data)."""
+    served = row.get("models_served")
+    if isinstance(served, str):
+        try:
+            served = json.loads(served)
+        except (TypeError, ValueError):
+            served = [served]
+    if isinstance(served, (list, tuple)) and served:
+        return sorted({str(x) for x in served if x})
+    m = row.get("model")
+    if m:
+        return sorted({str(m)})
+    return None
+
+def _json_row(r):
+    """Normalize a result dict to the canonical JSON field set."""
+    row = {}
+    for k in _RESULT_COLUMNS:
+        v = r.get(k)
+        if k == "models_served" and isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except (TypeError, ValueError):
+                v = None
+        row[k] = v
+    return row
+
+def _classify_diff(rows_a, rows_b):
+    """Classify the difference between two target-row snapshots.
+    Returns dict with new, gone, changed lists plus summary counts."""
+    am = {r["target"]: r for r in rows_a}
+    bm = {r["target"]: r for r in rows_b}
+
+    new = [bm[t] for t in sorted(bm.keys() - am.keys())]
+    gone = [am[t] for t in sorted(am.keys() - bm.keys())]
+    changed = []
+    for t in sorted(am.keys() & bm.keys()):
+        a, b = am[t], bm[t]
+        ch = {}
+        if (a.get("verdict") or "") != (b.get("verdict") or ""):
+            ch["verdict"] = [a.get("verdict"), b.get("verdict")]
+        if (a.get("product") or "") != (b.get("product") or ""):
+            ch["product"] = [a.get("product"), b.get("product")]
+        if (a.get("version") or "") != (b.get("version") or ""):
+            ch["version"] = [a.get("version"), b.get("version")]
+        aset, bset = _models_set(a), _models_set(b)
+        if aset is None or bset is None:
+            ch["models"] = "unknown"
+        elif aset != bset:
+            ch["models"] = [aset, bset]
+        if ch:
+            changed.append({
+                "target": t,
+                "from": _json_row(a),
+                "to": _json_row(b),
+                "changes": ch,
+            })
+    return {
+        "scan_a": None,
+        "scan_b": None,
+        "new": new,
+        "gone": gone,
+        "changed": changed,
+        "summary": {"new": len(new), "gone": len(gone), "changed": len(changed)},
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1416,6 +1596,24 @@ class Handler(BaseHTTPRequestHandler):
                 if h["id"] == sid:
                     return self._send(200, json.dumps({"results": h["results"]}))
             self._send(404, '{"error":"scan not found"}')
+        elif self.path.startswith("/api/scan-trend"):
+            self._send(200, json.dumps({"trend": _db_scan_trend()}))
+        elif self.path.startswith("/api/diff"):
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                a = qs.get("a", [""])[0]
+                b = qs.get("b", [""])[0]
+                if not a.isdigit() or not b.isdigit():
+                    return self._send(400, '{"error":"invalid scan ids"}')
+                scan_a, scan_b = int(a), int(b)
+                ra = _db_results(scan_a)
+                rb = _db_results(scan_b)
+                d = _classify_diff(ra, rb)
+                d["scan_a"] = scan_a
+                d["scan_b"] = scan_b
+                self._send(200, json.dumps(d))
+            except Exception as e:
+                self._send(400, json.dumps({"error": str(e)}))
         else:
             self._send(404, '{"error":"not found"}')
 

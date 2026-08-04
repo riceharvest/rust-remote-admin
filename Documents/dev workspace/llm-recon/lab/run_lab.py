@@ -56,15 +56,25 @@ REPORT_TIMEOUT = 120
 
 # name -> (expected_verdict, product_substr, forbidden_product_substr, expected_verify)
 CHECKS = {
-    "vllm":     ("GENUINE", "vllm",          None,     "live"),
-    "ollama":   ("GENUINE", "ollama",        None,     "live"),
-    "llamacpp": ("GENUINE", "llamacpp",      None,     "live"),
-    "honeypot": ("IMPOSTOR", "ollama",       None,     "honeypot"),
-    "authwall": ("UNKNOWN",  "unknown-http", None,     "skipped"),
-    "gateway":  ("GENUINE",  "openai-compat", "vllm",  "live"),
+    "vllm":       ("GENUINE", "vllm",          None,     "live"),
+    "ollama":     ("GENUINE", "ollama",        None,     "live"),
+    "llamacpp":   ("GENUINE", "llamacpp",      None,     "live"),
+    "honeypot":   ("IMPOSTOR", "ollama",       None,     "honeypot"),
+    "authwall":   ("UNKNOWN",  "unknown-http", None,     "skipped"),
+    "gateway":    ("GENUINE",  "openai-compat", "vllm",   "live"),
+    # Wave 2
+    "sglang":     ("GENUINE", "sglang",        None,     "live"),
+    "tgi":        ("GENUINE", "tgi",           None,     "live"),
+    "aphrodite":  ("GENUINE", "aphrodite",     None,     "live"),
+    "litellm":    ("GENUINE", "litellm",       None,     "live"),  # PROXY_INVENTORY must suppress IMPOSTOR
+    "triton":     ("GENUINE", "triton",        None,     "skipped"),  # no verify schema for triton
 }
 
-VERDICT_COUNTS_REPORT = {"GENUINE": 4, "IMPOSTOR": 1, "UNKNOWN": 1}
+VERDICT_COUNTS_REPORT = {
+    "GENUINE":  9,   # vllm, ollama, llamacpp, gateway, sglang, tgi, aphrodite, litellm, triton
+    "IMPOSTOR": 1,   # honeypot
+    "UNKNOWN":  1,   # authwall
+}
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +290,8 @@ def main():
                   f"{nreq:<6}{st}")
             if why:
                 print(f"{'':33}    ^ {why}")
-        md_ok = counts.get("GENUINE") == 4 and counts.get("IMPOSTOR") == 1 \
-            and counts.get("UNKNOWN") == 1
+        md_ok = all(counts.get(ver) == want
+                    for ver, want in VERDICT_COUNTS_REPORT.items())
         print(f"\n[report] summary verdict counts from DB: {counts} "
               f"({'PASS' if md_ok else 'FAIL'})")
         print(f"\n{'=' * 78}")
@@ -298,6 +308,10 @@ def main():
         print("     branch is only reachable when a GET-visible sig exists (e.g.")
         print("     Ollama :cloud or a gateway that lists models publicly).")
         print("     Reported to parent as a genuine srecon finding.")
+        print("  2. triton: no verify schema defined in _verify_schema() for triton")
+        print("     (TensorRT-LLM / Triton). The fixture expects verify='skipped',")
+        print("     which is the correct current behaviour. If a verify schema is")
+        print("     added later, update CHECKS['triton'] expected_verify accordingly.")
 
         return 1 if failures else 0
     finally:

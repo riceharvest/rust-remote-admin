@@ -22,16 +22,26 @@ Zero packets leave the machine:
 | `ollama` | Ollama `/api/tags`, `/api/version`, `/api/generate` | `GENUINE` / `ollama` | `live` |
 | `llamacpp` | llama.cpp `/props` (real markers) + `/completion` | `GENUINE` / `llamacpp` | `live` |
 | `honeypot` | Ollama-lookalike that answers `/api/generate` with `done=true` and an **empty** response | `IMPOSTOR` (flipped by verify) | `honeypot` |
-| `authwall` | `401` + sign-in HTML on every path | `UNKNOWN` | `skipped`\* |
+| `authwall` | `401` + sign-in HTML on every path | `UNKNOWN` | `skipped`* |
 | `gateway` | Bare OpenAI-compat gateway: `/v1/models` only, generic `Server: nginx` | `GENUINE` / `openai-compat` — **NOT vllm** | `live` |
+| `sglang` | SGLang `/get_model_info` (model_path), `/get_server_info`, `/version`, POST `/generate` | `GENUINE` / `sglang` | `live` |
+| `tgi` | TGI `/info` (model_id+version), `/` router banner, POST `/generate` | `GENUINE` / `tgi` | `tgi` |
+| `aphrodite` | Aphrodite Engine root JSON `app_name`, `/version`, `/v1/models` | `GENUINE` / `aphrodite` | `live` |
+| `litellm` | LiteLLM proxy: `/health/liveliness`=LIVE, `/models`, `/v1/models` mixed owned_by (openai+anthropic), `Server: litellm` | `GENUINE` / `litellm` — **NOT IMPOSTOR** (PROXY_INVENTORY suppresses) | `live` |
+| `triton` | Triton / TensorRT-LLM: `/v2/health/ready` 200, `/v2/models`, **no `/v1` paths** | `GENUINE` / `triton` | `skipped`† |
 
-\* **Spec note:** the parent spec asked for `verify=auth-walled` on the authwall
+* **Spec note:** the parent spec asked for `verify=auth-walled` on the authwall
 fixture. Current srecon cannot produce that for an all-401 server: status-200
 JSON is required for signature detection, so no sig → verdict `UNKNOWN`, and
 `verify_inference()` gets an empty sig set → no verify schema → `skipped`. The
 `auth-walled` branch is only reachable when a GET-visible sig exists (e.g.
 Ollama `:cloud` or a gateway that lists models publicly). See the FINDINGS block
 printed by `run_lab.py`.
+
+† **Note:** triton (TensorRT-LLM) has no verify schema defined in `_verify_schema()`
+(currently only ollama, llamacpp, tgi, and OpenAI-compat families have one).
+The fixture correctly expects `verify='skipped'`. If a verify schema is added
+later, update `CHECKS['triton']` in `run_lab.py`.
 
 The harness additionally checks the **db → report round-trip**: after the scan,
 it runs `srecon report --format md` and asserts every fixture's target and
@@ -65,7 +75,7 @@ manually if ever needed.
 
 ## Fixtures
 
-`lab/fixtures.py` defines six fixtures. Each is a `ThreadingHTTPServer` bound to
+`lab/fixtures.py` defines eleven fixtures. Each is a `ThreadingHTTPServer` bound to
 `127.0.0.1:0` (ephemeral port). Every request is logged to the shared
 `REQUEST_LOG` as `(fixture_name, method, path, status)`.
 
@@ -73,6 +83,22 @@ Routes are `(method, path) -> handler(post_body_bytes) -> (status, headers, body
 tables with `("*", path)` / `(method, "*")` wildcards, plus a per-fixture
 `default` route (e.g. the authwall's 401 HTML). `jresp()` is the JSON response
 helper; `_read_model()` echoes the `model` field from POST bodies.
+
+### Fixture list
+
+| Name | Key endpoints | Server header | Verify schema |
+|---|---|---|---|
+| `vllm` | `/version`, `/v1/models`, `/v1/completions` | `vllm/0.6.6` | openai |
+| `ollama` | `/api/tags`, `/api/version`, `/api/generate` | — | ollama |
+| `llamacpp` | `/props`, `/health`, `/completion` | — | llamacpp |
+| `honeypot` | `/api/tags` (fake), `/api/generate` (empty) | — | ollama → honeypot |
+| `authwall` | *all paths* → 401 HTML | — | skipped |
+| `gateway` | `/v1/models`, `/v1/completions` | `nginx` | openai |
+| `sglang` | `/get_model_info`, `/get_server_info`, `/version`, `/generate` | `sglang/0.3.0` | openai |
+| `tgi` | `/info`, `/v1/internal/model/info`, `/generate` | `tgi/2.0.0` | tgi |
+| `aphrodite` | `/` (app_name), `/version`, `/v1/models`, `/v1/completions` | — | openai |
+| `litellm` | `/health/liveliness`, `/models`, `/v1/models`, `/v1/completions` | `litellm` | openai |
+| `triton` | `/v2/health/ready`, `/v2/models` (no `/v1/*`) | `triton/24.08` | skipped |
 
 ## How to add a fixture
 

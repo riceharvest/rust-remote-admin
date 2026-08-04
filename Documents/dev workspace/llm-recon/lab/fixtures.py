@@ -190,6 +190,153 @@ def _gateway_routes():
     }
 
 
+# --- Wave 2 framework fixtures ------------------------------------------------
+
+def _sglang_routes():
+    """SGLang: /get_model_info with model_path, /get_server_info, /version,
+    POST /generate (OpenAI-compatible)."""
+    return {
+        ("GET", "/"): lambda _d: (200, {"Content-Type": "text/plain"},
+                                  b"SGLang"),
+        ("GET", "/version"): lambda _d: jresp(
+            {"version": "0.3.0", "app_name": "SGLang"}),
+        ("GET", "/get_model_info"): lambda _d: jresp(
+            {"model_path": "/models/meta-llama/Llama-3.1-8B-Instruct",
+             "tokenizer_path": "/models/meta-llama/Llama-3.1-8B-Instruct"}),
+        ("GET", "/get_server_info"): lambda _d: jresp(
+            {"version": "0.3.0"}),
+        ("GET", "/v1/models"): lambda _d: jresp({
+            "object": "list",
+            "data": [{
+                "id": "meta-llama/Llama-3.1-8B-Instruct",
+                "object": "model", "created": 1700000000,
+                "owned_by": "sglang",
+                "root": "meta-llama/Llama-3.1-8B-Instruct", "parent": None,
+                "permission": [{"id": "modelperm-lab", "object": "model_permission",
+                    "created": 1700000000, "allow_create_engine": False,
+                    "allow_sampling": True, "allow_logprobs": True,
+                    "allow_search": False, "allow_view": True,
+                    "allow_fine_tuning": False, "organization": "*",
+                    "group": None, "is_blocking": False}]}]}),
+        ("POST", "/generate"): lambda data: jresp({
+            "id": "cmpl-lab-sglang", "object": "text_completion",
+            "created": 1700000000, "model": _read_model(data),
+            "choices": [{"index": 0, "text": "Hello from fake SGLang!",
+                         "logprobs": None, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5,
+                      "total_tokens": 8}}),
+        ("POST", "/v1/completions"): lambda data: jresp({
+            "id": "cmpl-lab-sglang-v1", "object": "text_completion",
+            "created": 1700000000, "model": _read_model(data),
+            "choices": [{"index": 0, "text": "Hello from fake SGLang!",
+                         "logprobs": None, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5,
+                      "total_tokens": 8}}),
+    }
+
+
+def _tgi_routes():
+    """TGI: /info with version+model_id, / (router banner), POST /generate."""
+    return {
+        ("GET", "/"): lambda _d: (200, {"Content-Type": "text/plain"},
+                                  b"text-generation-inference router"),
+        ("GET", "/info"): lambda _d: jresp({
+            "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+            "version": "2.0.0",
+            "sha": "lab-build",
+            "docker_label": "ghcr.io/huggingface/text-generation-inference:2.0.0"}),
+        ("GET", "/v1/internal/model/info"): lambda _d: jresp({
+            "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+            "version": "2.0.0"}),
+        ("POST", "/generate"): lambda data: jresp([
+            {"generated_text": "Hello from fake TGI!",
+             "details": {"finish_reason": "length", "generated_tokens": 5}}]),
+    }
+
+
+def _aphrodite_routes():
+    """Aphrodite Engine: root JSON app_name Aphrodite-Engine, /version, /v1/models."""
+    return {
+        ("GET", "/"): lambda _d: jresp({
+            "app_name": "Aphrodite-Engine", "version": "1.0.0"}),
+        ("GET", "/version"): lambda _d: jresp({
+            "version": "1.0.0", "app_name": "Aphrodite-Engine"}),
+        ("GET", "/v1/models"): lambda _d: jresp({
+            "object": "list",
+            "data": [{
+                "id": "meta-llama/Llama-3.1-8B-Instruct",
+                "object": "model", "created": 1700000000,
+                "owned_by": "aphrodite",
+                "root": "meta-llama/Llama-3.1-8B-Instruct", "parent": None,
+                "permission": [{"id": "modelperm-lab", "object": "model_permission",
+                    "created": 1700000000, "allow_create_engine": False,
+                    "allow_sampling": True, "allow_logprobs": True,
+                    "allow_search": False, "allow_view": True,
+                    "allow_fine_tuning": False, "organization": "*",
+                    "group": None, "is_blocking": False}]}]}),
+        ("POST", "/v1/completions"): lambda data: jresp({
+            "id": "cmpl-lab-aph", "object": "text_completion",
+            "created": 1700000000, "model": _read_model(data),
+            "choices": [{"index": 0, "text": "Hello from fake Aphrodite!",
+                         "logprobs": None, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5,
+                      "total_tokens": 8}}),
+    }
+
+
+def _litellm_routes():
+    """LiteLLM proxy: /health/liveliness -> LIVE, /models list, /v1/models
+    with mixed owned_by (openai+anthropic), Server: litellm header.
+    This is a LEGIT proxy inventory — must NOT flip IMPOSTOR."""
+    server_hdr = {"Server": "litellm"}
+    return {
+        ("GET", "/"): lambda _d: jresp({"app": "litellm", "version": "1.40.0"}),
+        ("GET", "/health/liveliness"): lambda _d: (
+            200, {"Content-Type": "text/plain"}, b"LIVE"),
+        ("GET", "/models"): lambda _d: jresp([
+            "gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"]),
+        ("GET", "/v1/models"): lambda _d: jresp({
+            "object": "list",
+            "data": [
+                {"id": "gpt-4o", "object": "model", "created": 1700000000,
+                 "owned_by": "openai"},
+                {"id": "gpt-4o-mini", "object": "model", "created": 1700000000,
+                 "owned_by": "openai"},
+                {"id": "claude-3-5-sonnet-20241022", "object": "model",
+                 "created": 1700000000, "owned_by": "anthropic"},
+                {"id": "claude-3-haiku-20240307", "object": "model",
+                 "created": 1700000000, "owned_by": "anthropic"},
+            ]}, extra_headers=server_hdr),
+        ("POST", "/v1/completions"): lambda data: jresp({
+            "id": "cmpl-lab-litellm", "object": "text_completion",
+            "created": 1700000000, "model": _read_model(data),
+            "choices": [{"index": 0, "text": "Hello from fake LiteLLM!",
+                         "logprobs": None, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 6,
+                      "total_tokens": 9}}, extra_headers=server_hdr),
+    }
+
+
+def _triton_routes():
+    """TensorRT-LLM / Triton: /v2/health/ready 200, /v2/models list,
+    NO /v1 paths at all."""
+    return {
+        ("GET", "/"): lambda _d: (200, {"Content-Type": "text/plain"},
+                                  b"NVIDIA Triton Inference Server"),
+        ("GET", "/v2/health/ready"): lambda _d: jresp({"ready": True}),
+        ("GET", "/v2/models"): lambda _d: jresp({
+            "models": [
+                {"name": "llama-3.1-8b", "version": "1"},
+                {"name": "llama-3.1-70b", "version": "1"},
+            ]}),
+        # Explicit 404 for /v1/* to confirm they don't exist
+        ("*", "/v1/models"): lambda _d: (404, {"Content-Type": "application/json"},
+                                          b'{"error":"not found"}'),
+        ("*", "/v1/completions"): lambda _d: (404, {"Content-Type": "application/json"},
+                                               b'{"error":"not found"}'),
+    }
+
+
 # name -> (routes_builder, default_route, server_header)
 FIXTURE_SPECS = {
     "vllm":     (_vllm_routes, (404, {"Content-Type": "application/json"},
@@ -206,6 +353,17 @@ FIXTURE_SPECS = {
     "gateway":  (_gateway_routes, (404, {"Content-Type": "application/json"},
                                    b'{"error":"not found"}'),
                  "Server: nginx"),
+    # Wave 2
+    "sglang":   (_sglang_routes, (404, {"Content-Type": "application/json"},
+                                  b'{"error":"not found"}'), "Server: sglang/0.3.0"),
+    "tgi":      (_tgi_routes, (404, {"Content-Type": "application/json"},
+                                 b'{"error":"not found"}'), "Server: tgi/2.0.0"),
+    "aphrodite": (_aphrodite_routes, (404, {"Content-Type": "application/json"},
+                                      b'{"error":"not found"}'), None),
+    "litellm":  (_litellm_routes, (404, {"Content-Type": "application/json"},
+                                     b'{"error":"not found"}'), None),  # Server header in routes
+    "triton":   (_triton_routes, (404, {"Content-Type": "application/json"},
+                                   b'{"error":"not found"}'), "Server: triton/24.08"),
 }
 
 
@@ -296,7 +454,8 @@ class Fixture:
 
 def start_all(port=0):
     """Start every fixture. Returns a list of Fixture, one per spec, in the
-    canonical order (vllm, ollama, llamacpp, honeypot, authwall, gateway)."""
+    canonical order (vllm, ollama, llamacpp, honeypot, authwall, gateway,
+    sglang, tgi, aphrodite, litellm, triton)."""
     return [Fixture(name, port=port) for name in FIXTURE_SPECS]
 
 
