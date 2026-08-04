@@ -77,12 +77,12 @@ def load_db_results(scan_id=None, db_path=None):
     """Load results from the SQLite history DB (schema in ``db.py``).
 
     ``scan_id=None`` returns the whole history, most recently scanned first.
-    ``scan_id=N`` returns the single row whose SQLite ``rowid`` is N (the
-    ``targets`` table has no scan_id column; rowid is the stable per-target
-    identifier of the last recorded result).
+    ``scan_id=N`` returns all rows belonging to scan N of the ``scans`` table
+    (schema v2+). On legacy v0 DBs without a ``scan_id`` column, falls back to
+    the single ``targets`` row whose SQLite ``rowid`` is N.
 
     Raises ``FileNotFoundError`` if the DB file does not exist and
-    ``ValueError`` if a requested rowid is not present.
+    ``ValueError`` if a requested scan_id is not present.
     """
     if db_path is None:
         db_path = STATE_DB
@@ -91,10 +91,19 @@ def load_db_results(scan_id=None, db_path=None):
             f"history DB not found: {db_path} (run a scan first to populate it)")
     conn = sqlite3.connect(db_path)
     try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(targets)")}
+        has_scan_id = "scan_id" in cols
         if scan_id is None:
             rows = conn.execute(
                 "SELECT rowid, ip, port, verdict, product, score, scanned_at, fp "
                 "FROM targets ORDER BY scanned_at DESC, ip, port").fetchall()
+        elif has_scan_id:
+            rows = conn.execute(
+                "SELECT rowid, ip, port, verdict, product, score, scanned_at, fp "
+                "FROM targets WHERE scan_id = ? "
+                "ORDER BY ip, port", (int(scan_id),)).fetchall()
+            if not rows:
+                raise ValueError(f"no history rows for scan_id {scan_id} in {db_path}")
         else:
             rows = conn.execute(
                 "SELECT rowid, ip, port, verdict, product, score, scanned_at, fp "

@@ -209,6 +209,7 @@ def cmd_scan(args):
     results = []
     t_start = time.time()
     total = 0
+    scan_id = None
 
     for ev in scan_events(
         lines,
@@ -271,6 +272,10 @@ def cmd_scan(args):
             elif args.ndjson:
                 print(json.dumps(ev))
         elif etype in ("done", "stopped"):
+            # scan_id comes from the engine's DB scan session; emit it so the
+            # operator can re-run `srecon report --scan-id N` afterwards.
+            if ev.get("scan_id") is not None:
+                scan_id = ev["scan_id"]
             if args.ndjson:
                 print(json.dumps(ev))
         # probes: skip in CLI output (too noisy) unless ndjson
@@ -282,6 +287,7 @@ def cmd_scan(args):
         # final summary line
         print(json.dumps({
             "type": "summary",
+            "scan_id": scan_id,
             "total_results": len(results),
             "elapsed_s": elapsed,
         }))
@@ -318,6 +324,9 @@ def cmd_scan(args):
     _eprint(f"  UNKNOWN:   {unknown}")
     _eprint(f"  DARK:      {dark}")
     _eprint(f"  ERROR:     {error}")
+    if scan_id is not None:
+        _eprint(f"  SCAN ID:   {scan_id}")
+        _eprint(f"  re-run:    srecon report --scan-id {scan_id} --format html -o report.html")
     _eprint(f"{'='*70}")
 
     if display:

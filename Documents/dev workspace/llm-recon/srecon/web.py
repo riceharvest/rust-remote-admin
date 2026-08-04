@@ -2,13 +2,17 @@
 import argparse
 import json
 import resource
+import sqlite3
 import threading
 import time
 import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .config import PROBE_TIMEOUT, SCANS, HISTORY
+from .config import (
+    PROBE_TIMEOUT, PROBE_PATHS, FRAMEWORKS, SCANS, HISTORY, STATE_DB,
+)
+from .db import list_scans
 from .engine import scan_events
 from .targets import country_cidrs, bgpview_prefixes
 from .packs import PACKS
@@ -175,15 +179,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="hint">// fingerprint only. no inference traffic. collection of open banners is authorized; use of foreign compute is not.</div>
     <div class="chips simp-hide" style="margin-top:10px" id="fwchips">
       <span style="color:var(--phos-dim);font-size:11px;margin-right:8px">FRAMEWORKS:</span>
-      <span class="chip on" data-fw="vllm">VLLM</span>
-      <span class="chip on" data-fw="llamacpp">LLAMA.CPP</span>
-      <span class="chip on" data-fw="sglang">SGLANG</span>
-      <span class="chip on" data-fw="ollama">OLLAMA</span>
-      <span class="chip on" data-fw="lmstudio">LM STUDIO</span>
-      <span class="chip on" data-fw="koboldcpp">KOBOLDCPP</span>
-      <span class="chip on" data-fw="tgwui">TEXTGEN-WEBUI</span>
-      <span class="chip on" data-fw="tgi">TGI</span>
-      <span class="chip on" data-fw="openwebui">OPEN WEBUI</span>
+      <!-- chips injected client-side from srecon.config.FRAMEWORKS (never stale) -->
     </div>
     <div class="opts adv-only">
       <label>WORKERS <input type="number" id="opt-workers" value="1000" min="1" max="5000"></label>
@@ -381,7 +377,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="classif">TOP SECRET // SILICON // NOFORN</div>
 </div>
 <script>
-const PATHS = ["/","/props","/health","/version","/v1/models","/get_model_info","/get_server_info","/api/tags","/api/version","/api/v0/models","/api/extra/version","/api/v1/model","/v1/internal/model/info","/info","/api/config"];
+const PATHS = __PROBE_PATHS_JSON__;
 const RENDER_CAP = 1000;
 const S = {
   mode: 'advanced', results: [], total: 0, done: 0, reqs: 0,
@@ -427,7 +423,7 @@ const PRESETS = {
 };
 const PRESET_HINTS = {
   fast:     'FAST SWEEP — broad reach. lean ports, DoD excluded, progressive pre-sweep, 7-day dedup. best for big ranges.',
-  standard: 'STANDARD — balanced fingerprinting. all 9 frameworks, full enrichment, every high-yield optimization. recommended.',
+  standard: 'STANDARD — balanced fingerprinting. every framework, full enrichment, every high-yield optimization. recommended.',
   deep:     'DEEP SCAN — thorough single-target audit. slow profile, long timeout, diff mode, no prefilter. best for one suspect host.',
 };
 function applyPreset(name) {
@@ -457,6 +453,31 @@ document.querySelectorAll('#presetchips .chip').forEach(ch => {
 // ---------- target packs (cloud providers → announced prefixes) ----------
 // injected from srecon.packs at render time — single source of truth
 const PACKS = __PACKS_JSON__;
+
+// injected from srecon.config.FRAMEWORKS / PROBE_PATHS at render time — the
+// single source of truth for framework chips + probe paths + per-framework
+// ports, so the console never goes stale when config.py grows.
+const FRAMEWORKS = __FRAMEWORKS_JSON__;
+const FW_LABELS = {
+  llamacpp: 'LLAMA.CPP', lmstudio: 'LM STUDIO', tgwui: 'TEXTGEN-WEBUI',
+  openwebui: 'OPEN WEBUI', tabbyapi: 'TABBYAPI', localai: 'LOCALAI',
+  xinference: 'XINFERENCE', litellm: 'LITELLM', aphrodite: 'APHRODITE',
+  triton: 'TRITON', mlc: 'MLC',
+};
+function fwLabel(fw) {
+  if (FW_LABELS[fw]) return FW_LABELS[fw];
+  return fw.toUpperCase().replace(/[_-]/g, '.');
+}
+(function buildFwChips() {
+  const c = $('fwchips');
+  for (const fw of Object.keys(FRAMEWORKS)) {
+    const s = document.createElement('span');
+    s.className = 'chip on';
+    s.dataset.fw = fw;
+    s.textContent = fwLabel(fw);
+    c.appendChild(s);
+  }
+})();
 async function loadPack(name) {
   const pk = PACKS[name]; if (!pk) return;
   const chip = document.querySelector(`#packchips .chip[data-pack="${name}"]`);
@@ -550,7 +571,9 @@ function selectedFrameworks() {
 }
 
 // ---------- CIDR builder ----------
-const FW_PORTS = {vllm:[8000,8001], llamacpp:[8080], sglang:[30000], ollama:[11434], lmstudio:[1234], koboldcpp:[5001], tgwui:[5000], tgi:[80,3000], openwebui:[3000]};
+// per-framework ports derived from config.FRAMEWORKS (single source of truth)
+const FW_PORTS = {};
+for (const fw of Object.keys(FRAMEWORKS)) FW_PORTS[fw] = FRAMEWORKS[fw].ports || [];
 const ipToInt = ip => ip.split('.').reduce((a, o) => (a << 8) + (+o), 0) >>> 0;
 const intToIp = n => [(n>>>24)&255, (n>>>16)&255, (n>>>8)&255, n&255].join('.');
 
@@ -1237,6 +1260,97 @@ refreshHistory();
 """
 
 
+# ---------------------------------------------------------------------------
+# DB-backed scan history (survives restart). The engine persists every result
+# to the targets table linked to a scans-table scan_id, so the console can
+# rehydrate archived scans from SQLite instead of the volatile in-memory
+# HISTORY deque. In-memory HISTORY is kept for the live-session string-id path.
+# ---------------------------------------------------------------------------
+_TARGET_COLS = (
+    "ip", "port", "verdict", "product", "score", "model", "models_served",
+    "version", "verify_result", "verify_detail", "latency_ms", "asn",
+    "as_name", "bgp_prefix", "net_type", "error",
+)
+
+
+def _db_scans():
+    """Return scan-history rows read from the scans table (newest first),
+    with verdict tallies from the linked targets rows."""
+    try:
+        base = list_scans()
+    except Exception:
+        base = []
+    out = []
+    try:
+        conn = sqlite3.connect(STATE_DB)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            for s in base:
+                sid = s.get("scan_id")
+                row = conn.execute(
+                    "SELECT COUNT(*), "
+                    "       COALESCE(SUM(verdict='GENUINE'),0), "
+                    "       COALESCE(SUM(verdict='IMPOSTOR'),0), "
+                    "       COALESCE(SUM(verdict='UNKNOWN'),0) "
+                    "FROM targets WHERE scan_id=?", (sid,)).fetchone()
+                n, genuine, impostor, unknown = row
+                started = s.get("started_at")
+                when = (time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(started))
+                        if started else "")
+                out.append({
+                    "id": str(sid), "when": when,
+                    "started_at": started, "finished_at": s.get("finished_at"),
+                    "target_count": s.get("target_count"),
+                    "params_json": s.get("params_json"),
+                    "stats_json": s.get("stats_json"),
+                    "total": n, "genuine": genuine,
+                    "impostor": impostor, "unknown": unknown,
+                })
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return out
+
+
+def _db_results(scan_id):
+    """Rehydrate archive-loaded dossier dicts from the targets table."""
+    try:
+        conn = sqlite3.connect(STATE_DB)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            rows = conn.execute(
+                f"SELECT {','.join(_TARGET_COLS)} FROM targets "
+                "WHERE scan_id=? ORDER BY scanned_at", (scan_id,)).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    out = []
+    for (ip, port, verdict, product, score, model, models_served, version,
+         verify_result, verify_detail, latency_ms, asn, as_name, bgp_prefix,
+         net_type, error) in rows:
+        if models_served:
+            try:
+                models_served = json.loads(models_served)
+            except Exception:
+                models_served = [models_served]
+        else:
+            models_served = []
+        out.append({
+            "target": f"{ip}:{port}", "product": product or "unknown",
+            "verdict": verdict, "score": score or 0,
+            "model": model, "models_served": models_served, "version": version,
+            "verify_result": verify_result, "verify_detail": verify_detail,
+            "latency_ms": latency_ms,
+            "asn": asn, "as_name": as_name, "bgp_prefix": bgp_prefix,
+            "net_type": net_type, "error": error,
+            # not persisted in the targets schema: degrade gracefully
+            "flags": [], "ptr": None, "inventory_hash": None, "endpoints": {},
+        })
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - silence request logging
         pass
@@ -1251,20 +1365,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            page = PAGE.replace("__PACKS_JSON__", json.dumps(PACKS))
+            page = (PAGE
+                    .replace("__PACKS_JSON__", json.dumps(PACKS))
+                    .replace("__FRAMEWORKS_JSON__", json.dumps(FRAMEWORKS))
+                    .replace("__PROBE_PATHS_JSON__", json.dumps(PROBE_PATHS)))
             self._send(200, page, "text/html; charset=utf-8")
         elif self.path == "/api/history":
-            scans = []
-            for h in HISTORY:
-                tally = {}
-                for r in h["results"]:
-                    tally[r["verdict"]] = tally.get(r["verdict"], 0) + 1
-                scans.append({
-                    "id": h["id"], "when": h["when"], "total": len(h["results"]),
-                    "genuine": tally.get("GENUINE", 0),
-                    "impostor": tally.get("IMPOSTOR", 0),
-                })
-            self._send(200, json.dumps({"scans": scans}))
+            # DB-backed scan history (survives restart); live scans land here
+            # as soon as the engine persists their first result row.
+            self._send(200, json.dumps({"scans": _db_scans()}))
         elif self.path.startswith("/api/asn-prefixes"):
             try:
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -1292,7 +1401,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(502, json.dumps({"error": f"RIR fetch failed: {e}"}))
         elif self.path.startswith("/api/history?id="):
-            sid = self.path.split("id=", 1)[1]
+            sid = urllib.parse.unquote(self.path.split("id=", 1)[1].split("&", 1)[0])
+            try:
+                db_id = int(sid)
+            except (TypeError, ValueError):
+                db_id = None
+            if db_id is not None:
+                # DB archive: read rows from the targets table by scan_id.
+                # Return empty results (200) for a valid-but-empty scan rather
+                # than 404 so the console history loader stays idempotent.
+                return self._send(200, json.dumps({"results": _db_results(db_id)}))
+            # fallback: live in-memory session history (string scan ids)
             for h in HISTORY:
                 if h["id"] == sid:
                     return self._send(200, json.dumps({"results": h["results"]}))

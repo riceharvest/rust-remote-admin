@@ -186,17 +186,26 @@ python3 silicon_recon.py --port 7777
 
 ## Supported frameworks
 
+Frameworks match `FRAMEWORKS` in `srecon/config.py`:
+
 | Framework | Default port(s) |
 |---|---|
 | vLLM | 8000, 8001 |
 | llama.cpp server | 8080 |
-| Ollama | 11434 |
 | SGLang | 30000 |
-| Text Generation Inference (TGI) | 80, 3000 |
+| Ollama | 11434 |
 | LM Studio | 1234 |
 | KoboldCpp | 5001 |
-| Text Generation WebUI | 5000 |
+| Text Generation WebUI | 5000, 7860 |
+| Text Generation Inference (TGI) | 80, 3000 |
 | Open WebUI | 3000 |
+| Aphrodite Engine | 2242 |
+| Triton Inference Server | 8000 |
+| LocalAI | 8080 |
+| Xinference | 9997 |
+| LiteLLM | 4000 |
+| TabbyAPI | 5000 |
+| MLC-LLM | 8080 |
 
 `--sweep-all-ports` probes every known LLM port regardless of the framework filter —
 useful for discovery when you don't know what a host is running.
@@ -240,6 +249,35 @@ silicon_recon.py    # backward-compat launcher (delegates to srecon.serve)
   `--include-dod` to override.
 - **Enrichment** uses RIPEstat and DNS; no API keys required. Rate limits apply on
   very large scans.
+
+---
+
+## Local test lab
+
+Consent-free, fully-offline testing of the whole pipeline. `lab/fixtures.py`
+stands up fake vLLM / Ollama / llama.cpp / honeypot / auth-walled / bare-gateway
+servers on `127.0.0.1`, and `python3 lab/run_lab.py` points a REAL
+`python3 -m srecon scan --targets <the lab's own 127.0.0.1 ports> --verify` at
+them, then renders the results back out of SQLite via `srecon report` — so
+`engine → fingerprint → verify → db → report` is exercised end-to-end with zero
+packets leaving the machine (ASN enrichment is disabled). It prints a PASS/FAIL
+table of expected verdicts and exits non-zero on any mismatch.
+
+```bash
+# from the repo root
+python3 lab/run_lab.py
+```
+
+The lab isolates the DB by swapping the real `srecon/data/` aside for a fresh
+temp copy during the run and restoring it afterwards — the real `state.db` and
+honeypot blocklist are never touched. See `lab/README.md` for what each fixture
+proves, the run instructions, and how to add a new fixture.
+
+> **Known issue (as of this writing):** the async scan engine currently marks
+> every live host `ERROR` because `engine._Conn.get()` stores response-header
+> keys as bytes and `probe._header_evidence()` crashes on them. `run_lab.py`
+> detects this and prints the root cause; the lab's fixtures are independently
+> verified via the sync probe path and classify exactly as the table expects.
 
 ---
 

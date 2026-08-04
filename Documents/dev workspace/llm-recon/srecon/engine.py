@@ -15,6 +15,7 @@ from .config import (
 )
 from .db import (
     load_blocklist, add_blocklist, store_scan_result,
+    start_scan, finish_scan,
     scan_cache_hits_batch, fingerprint_hash, diff_check,
 )
 from .net import (
@@ -81,7 +82,7 @@ class _Conn:
                 for line in head.split(b"\r\n")[1:]:
                     if b":" in line:
                         k, v = line.split(b":", 1)
-                        headers[k.strip().lower()] = v.strip()
+                        headers[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
                 if "chunked" in headers.get("transfer-encoding", "").lower():
                     body = await asyncio.wait_for(_read_chunked(self.reader), timeout)
                 elif "content-length" in headers:
@@ -557,6 +558,33 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
     hb_state["stop"].set()
     hb_thread.join(timeout=1)
 
+    # --- open the scan session row ---
+    # Captures scan parameters (targets source, framework filter, options) as
+    # params_json; the returned DB scan_id links every persisted result row and
+    # is surfaced on the start/done/stopped events so CLI consumers can run
+    # `report --scan-id N` afterwards. The event stream shape is unchanged.
+    scan_params = {
+        "frameworks": frameworks,
+        "ports": ports,
+        "input_targets": len(seed_lines),
+        "excludes": excludes or [],
+        "exclude_dod": exclude_dod,
+        "options": {
+            "workers": workers, "timeout": timeout, "enrich": enrich,
+            "fast": fast, "lean_ports": lean_ports, "dedup": dedup,
+            "asn_prefilter": asn_prefilter, "fanout": fanout,
+            "progressive": progressive, "banner_prefilter": banner_prefilter,
+            "adaptive_timeout": adaptive_timeout, "content_dedup": content_dedup,
+            "diff_mode": diff_mode, "ptr_seed": ptr_seed,
+            "ct_search_seed": ct_search_seed, "shodan_seed": shodan_seed,
+            "sweep_all_ports": sweep_all_ports, "verify": verify,
+        },
+    }
+    verdict_counts = {"GENUINE": 0, "IMPOSTOR": 0, "UNKNOWN": 0,
+                      "DARK": 0, "ERROR": 0}
+    scan_id = start_scan(target_count=(len(targets) if targets else 0),
+                         params=scan_params)
+
     yield {"type": "start", "total": len(targets),
            "frameworks": frameworks, "ports": ports,
            "excluded_nets": len(excl_nets), "truncated": truncated,
@@ -564,10 +592,14 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
            "workers": workers, "fd_capped": capped,
            "dedup_skipped": len(skip_set), "prefiltered": prefilt_dropped,
            "blocklisted": len(blocklist), "seeded": seed_count,
-           "progressive_dropped": pre_swept}
+           "progressive_dropped": pre_swept,
+           "scan_id": scan_id}
     t0 = time.time()
     if not targets:
-        yield {"type": "done", "requests": 0, "elapsed_s": 0}
+        finish_scan(scan_id, {"requests": 0, "elapsed_s": 0,
+                              "verdicts": verdict_counts})
+        yield {"type": "done", "requests": 0, "elapsed_s": 0,
+               "scan_id": scan_id}
         return
     q = queue.Queue()
     reqs = [0]
@@ -588,8 +620,13 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
         while not (got >= len(targets) and engine_done):
             if cancel is not None and cancel.is_set():
                 el = round(time.time() - t0, 1)
+                stats = {"requests": reqs[0], "elapsed_s": el,
+                         "hosts_per_s": round(got / el, 1) if el else 0,
+                         "verdicts": verdict_counts, "status": "stopped"}
+                finish_scan(scan_id, stats)
                 yield {"type": "stopped", "done": got, "requests": reqs[0],
-                       "elapsed_s": el, "hosts_per_s": round(got / el, 1) if el else 0}
+                       "elapsed_s": el, "hosts_per_s": round(got / el, 1) if el else 0,
+                       "scan_id": scan_id}
                 return
             try:
                 ev = q.get(timeout=0.25)
@@ -602,13 +639,25 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
             elif ev["type"] == "result":
                 got += 1
                 d = ev["data"]
-                store_scan_result(d)  # persist to SQLite
+                verdict_counts[d.get("verdict", "DARK")] = \
+                    verdict_counts.get(d.get("verdict", "DARK"), 0) + 1
+                store_scan_result(d, scan_id=scan_id)  # persist to SQLite, linked to scan
             elif ev["type"] == "enrich_done":
                 engine_done = True
                 continue  # internal marker, not streamed
             yield ev
+    except Exception as e:
+        # engine failure mid-scan: still close the scan row, flagged with error
+        el = round(time.time() - t0, 1)
+        finish_scan(scan_id, {"requests": reqs[0], "elapsed_s": el,
+                              "verdicts": verdict_counts,
+                              "status": "error", "error": str(e)})
+        raise
     finally:
         eng.join(timeout=5)
     el = round(time.time() - t0, 1)
+    hps = round(got / el, 1) if el else 0
+    finish_scan(scan_id, {"requests": reqs[0], "elapsed_s": el,
+                          "hosts_per_s": hps, "verdicts": verdict_counts})
     yield {"type": "done", "requests": reqs[0], "elapsed_s": el,
-           "hosts_per_s": round(got / el, 1) if el else 0}
+           "hosts_per_s": hps, "scan_id": scan_id}
