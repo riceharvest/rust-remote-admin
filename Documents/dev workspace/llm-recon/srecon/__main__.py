@@ -5,6 +5,10 @@ Usage:
     python3 -m srecon scan --targets 1.2.3.4:8000,5.6.7.8:11434
     python3 -m srecon report --input results.json --format html -o report.html
     python3 -m srecon report --scan-id 5 --format csv
+    python3 -m srecon report --scan-id 5 --format json --scans
+    python3 -m srecon scans [--last 10] [--json]
+    python3 -m srecon diff 1 2 [--json]
+    python3 -m srecon import shodan.jsonl [--format shodan] [--scan-id 6] [--dry-run]
     python3 -m srecon prefixes --asn 24940
     python3 -m srecon cidrs --cc DE
     python3 -m srecon packs
@@ -100,12 +104,21 @@ def cmd_serve(args):
 
 
 def cmd_report(args):
-    """Render scan results as an offline report (HTML / Markdown / CSV)."""
+    """Render scan results as an offline report (HTML / Markdown / CSV / JSON)."""
     from .report import load_json_results, load_db_results, render_report
+    from . import db as _db
 
     if args.input and args.scan_id is not None:
         _eprint("error: --input and --scan-id are mutually exclusive")
         sys.exit(1)
+    if args.scans and args.input is not None:
+        _eprint("error: --scans embeds the session list only for DB reports "
+                "(--scan-id or no source); it is incompatible with --input")
+        sys.exit(1)
+
+    scans = None
+    if args.scans:
+        scans = _db.list_scans()
 
     if args.input:
         try:
@@ -127,7 +140,7 @@ def cmd_report(args):
             src += f" row {args.scan_id}"
 
     try:
-        out = render_report(results, args.format, meta)
+        out = render_report(results, args.format, meta, scans)
     except ValueError as e:
         _eprint(f"error: {e}")
         sys.exit(1)
@@ -143,6 +156,64 @@ def cmd_report(args):
             sys.exit(1)
     else:
         sys.stdout.write(out)
+
+
+def cmd_scans(args):
+    """List scan sessions from the scans table (UTC times, verdict counts)."""
+    from . import db as _db
+    from .report import scan_view, render_scans_human
+
+    rows = _db.list_scans()
+    if args.last:
+        rows = rows[: args.last]
+    views = [scan_view(s) for s in rows]
+    if args.json:
+        for v in views:
+            print(json.dumps(v))
+        return
+    if not views:
+        print("No scan sessions recorded.")
+        return
+    print(render_scans_human(views))
+
+
+def cmd_diff(args):
+    """Compare two scan sessions' target rows (NEW / GONE / CHANGED)."""
+    from .report import diff_scans, render_diff_human
+
+    try:
+        d = diff_scans(args.scan_a, args.scan_b)
+    except (FileNotFoundError, ValueError) as e:
+        _eprint(f"error: {e}")
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(d, indent=2, default=str))
+    else:
+        print(render_diff_human(d))
+
+
+def cmd_import(args):
+    """Ingest an offline Shodan/Censys export into the history DB."""
+    from .imports import import_file
+
+    try:
+        counts = import_file(
+            args.file, fmt=args.format, scan_id=args.scan_id, dry_run=args.dry_run)
+    except Exception as e:  # noqa: BLE001 - CLI always prints a verdict
+        _eprint(f"error: import failed: {e}")
+        sys.exit(1)
+    if counts.get("error"):
+        _eprint(f"error: {counts['error']}")
+        sys.exit(1)
+    if args.dry_run:
+        print(f"dry-run {args.file}: imported={counts['imported']} "
+              f"errors={counts['errors']} format={counts.get('format')!r}")
+        from .imports import _print_results
+        print("first mapped results:")
+        _print_results(counts.get("results", []))
+    else:
+        print(f"imported={counts['imported']} skipped={counts['skipped']} "
+              f"errors={counts['errors']}")
 
 
 def cmd_scan(args):
@@ -427,11 +498,44 @@ def main():
                      help="History DB row by SQLite rowid (the targets table has no scan_id column); "
                           "renders the last recorded result for that row. Omit both --input and "
                           "--scan-id to render the full scan history.")
-    p_rep.add_argument("--format", choices=["html", "md", "csv"], default="html",
+    p_rep.add_argument("--format", choices=["html", "md", "csv", "json"], default="html",
                        help="Output format (default: html)")
+    p_rep.add_argument("--scans", action="store_true",
+                       help="Embed the scan-session list as a header section "
+                            "(params pretty-printed) when rendering a DB report")
     p_rep.add_argument("--output", "-o", metavar="FILE",
                        help="Write the report to FILE (default: stdout)")
     p_rep.set_defaults(func=cmd_report)
+
+    # --- scans ---
+    p_scans = sub.add_parser("scans", help="List scan sessions (UTC times, verdict counts)")
+    p_scans.add_argument("--last", type=int, metavar="N", default=None,
+                         help="Only show the N most recent scans")
+    p_scans.add_argument("--json", action="store_true",
+                         help="Emit one JSON object per scan (NDJSON)")
+    p_scans.set_defaults(func=cmd_scans)
+
+    # --- diff ---
+    p_diff = sub.add_parser("diff", help="Compare two scan sessions' target rows")
+    p_diff.add_argument("scan_a", type=int, metavar="A",
+                        help="First scan_id (baseline)")
+    p_diff.add_argument("scan_b", type=int, metavar="B",
+                        help="Second scan_id (comparison)")
+    p_diff.add_argument("--json", action="store_true",
+                        help="Emit machine-readable diff JSON")
+    p_diff.set_defaults(func=cmd_diff)
+
+    # --- import ---
+    p_imp = sub.add_parser("import",
+                           help="Ingest an offline Shodan/Censys export into the history DB")
+    p_imp.add_argument("file", help="Path to the export file (.jsonl/.json/.csv)")
+    p_imp.add_argument("--format", choices=["shodan", "censys"], default=None,
+                       help="Format hint (auto-detected otherwise)")
+    p_imp.add_argument("--scan-id", type=int, metavar="N", default=None,
+                       help="Scan row to associate imported rows with")
+    p_imp.add_argument("--dry-run", action="store_true",
+                       help="Parse + map only; do not touch the database")
+    p_imp.set_defaults(func=cmd_import)
 
     args = ap.parse_args()
     if not args.command:

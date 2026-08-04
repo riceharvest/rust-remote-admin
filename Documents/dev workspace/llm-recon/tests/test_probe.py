@@ -30,13 +30,14 @@ def make_dossier(endpoints):
         "models_served": [],
         "flags": [],
         "endpoints": endpoints,
-        "latency_ms": 1,
+        "latency_ms": 120,
         "error": None,
         "asn": None,
         "as_name": None,
         "bgp_prefix": None,
         "net_type": None,
         "score": 0,
+        "score_reasons": [],
         "inventory_hash": None,
         "verify_result": None,
         "verify_detail": None,
@@ -256,6 +257,7 @@ class AnalyzeVerdictsTest(unittest.TestCase):
 
     def test_impossible_proprietary_inventory(self):
         # claims two proprietary vendors on one box -> IMPOSTOR
+        # (bare surface with no headers also trips MISSING_SERVER_HEADER)
         d = make_dossier({
             "/v1/models": ep(200, {"data": [
                 {"id": "gpt-4", "owned_by": "openai"},
@@ -265,7 +267,8 @@ class AnalyzeVerdictsTest(unittest.TestCase):
         out = probe.analyze(d)
         self.assertEqual(out["verdict"], "IMPOSTOR")
         self.assertIn("IMPOSSIBLE_INVENTORY", flag_names(out))
-        self.assertEqual(out["score"], 40)
+        self.assertIn("MISSING_SERVER_HEADER", flag_names(out))
+        self.assertEqual(out["score"], 55)
 
     def test_single_proprietary_vendor_merely_suspicious(self):
         d = make_dossier({
@@ -527,6 +530,359 @@ class VerifyInferenceTest(unittest.TestCase):
         self.assertEqual(verdict, "skipped")
         self.assertEqual(detail, "no verify schema for product unknown")
         self.assertEqual(self.FakeHTTPConnection.instances, [])
+
+
+class VersionExtractionTest(unittest.TestCase):
+    """Every framework's version must surface as result['version'] — from
+    framework-specific endpoints, the generic /version fallback, or headers."""
+
+    def test_vllm_version_from_json(self):
+        d = make_dossier({
+            "/version": ep(200, {"version": "v0.6.6.post1", "app_name": "vLLM"}),
+            "/v1/models": ep(200, {"data": [{"id": "Qwen-7B", "owned_by": "vllm"}]},
+                             headers={"server": "vllm/0.6.6"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "vllm")
+        self.assertEqual(out["version"], "v0.6.6.post1")
+
+    def test_vllm_version_from_x_header_only(self):
+        d = make_dossier({
+            "/v1/models": ep(200, {"data": [{"id": "Qwen-7B"}]},
+                             headers={"x-vllm": "0.6.6"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "vllm")
+        self.assertEqual(out["version"], "0.6.6")
+
+    def test_ollama_version(self):
+        d = make_dossier({
+            "/": ep(200, None, "Ollama is running"),
+            "/api/tags": ep(200, {"models": [{"name": "llama3.2:1b"}]}),
+            "/api/version": ep(200, {"version": "0.5.7"}),
+        })
+        self.assertEqual(probe.analyze(d)["version"], "0.5.7")
+
+    def test_llamacpp_version_from_banner_header(self):
+        # build_info absent -> mine the "Server: llama-cpp-rXXXX" banner
+        d = make_dossier({
+            "/props": ep(200, {"model_path": "/m.gguf",
+                               "default_generation_settings": {},
+                               "total_slots": 1, "build_info": {},
+                               "chat_template": ""},
+                          headers={"server": "llama-cpp-r2285"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "llamacpp")
+        self.assertEqual(out["version"], "r2285")
+
+    def test_sglang_version_from_get_server_info(self):
+        d = make_dossier({
+            "/get_model_info": ep(200, {"model_path": "/models/llama-3-8b"}),
+            "/get_server_info": ep(200, {"version": "0.4.5"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "sglang")
+        self.assertEqual(out["version"], "0.4.5")
+        self.assertEqual(out["models_served"], ["/models/llama-3-8b"])
+        self.assertEqual(out["model"], "/models/llama-3-8b")
+
+    def test_sglang_version_from_version_endpoint(self):
+        # /get_server_info absent -> /version fallback
+        d = make_dossier({
+            "/get_model_info": ep(200, {"model_path": "/models/llama-3-8b"}),
+            "/version": ep(200, {"version": "0.4.1", "app_name": "sglang"}),
+        })
+        self.assertEqual(probe.analyze(d)["version"], "0.4.1")
+
+    def test_tgi_version(self):
+        d = make_dossier({
+            "/info": ep(200, {"model_id": "meta-llama/Llama-3.1-8B",
+                              "version": "2.4.0"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "tgi")
+        self.assertEqual(out["version"], "2.4.0")
+
+    def test_aphrodite_version(self):
+        d = make_dossier({
+            "/version": ep(200, {"app_name": "Aphrodite-Engine",
+                                 "version": "0.6.6"}),
+            "/v1/models": ep(200, {"data": [{"id": "mistral-7b"}]}),
+        })
+        out = probe.analyze(d)
+        self.assertIn("aphrodite", out["product"])
+        self.assertEqual(out["version"], "0.6.6")
+
+    def test_litellm_version_from_version_endpoint(self):
+        d = make_dossier({
+            "/health/liveliness": ep(200, None, "LIVE"),
+            "/models": ep(200, ["gpt-4o-mini"]),
+            "/version": ep(200, {"version": "1.45.0"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "litellm")
+        self.assertEqual(out["version"], "1.45.0")
+
+    def test_localai_version(self):
+        d = make_dossier({
+            "/readyz": ep(200, None, "READY"),
+            "/v1/models": ep(200, {"data": [{"id": "gpt-4"}]}),
+            "/version": ep(200, {"version": "2.23.3"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "localai")
+        self.assertEqual(out["version"], "2.23.3")
+
+    def test_lmstudio_version_from_version_endpoint(self):
+        d = make_dossier({
+            "/api/v0/models": ep(200, {"data": [{"id": "llama-3.2-3b"}]}),
+            "/version": ep(200, {"version": "0.3.9"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "lmstudio")
+        self.assertEqual(out["version"], "0.3.9")
+
+    def test_koboldcpp_version(self):
+        d = make_dossier({
+            "/api/extra/version": ep(
+                200, {"result": "KoboldCpp v1.79", "version": "1.79"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "koboldcpp")
+        self.assertEqual(out["version"], "1.79")
+
+    def test_llamacpp_model_depth_uses_alias_and_dgs(self):
+        # model_alias and default_generation_settings.model both deepen the
+        # served-model name beyond model_path
+        d = make_dossier({
+            "/props": ep(200, {
+                "model_path": "/models/llama-3.2-1b-instruct.Q4_K_M.gguf",
+                "model_alias": "my-alias",
+                "default_generation_settings": {"model": "llama-3.2-1b"},
+                "total_slots": 1, "build_info": "b1234", "chat_template": ""}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["model"], "my-alias")
+        self.assertEqual(out["models_served"], ["my-alias"])
+
+    def test_ollama_model_meta_from_tags_details(self):
+        # GET-visible depth: /api/tags "details" carries parameter size/quant
+        d = make_dossier({
+            "/": ep(200, None, "Ollama is running"),
+            "/api/tags": ep(200, {"models": [
+                {"name": "llama3.2:1b", "details": {
+                    "parameter_size": "1.24B",
+                    "quantization_level": "Q4_K_M"}}]}),
+            "/api/version": ep(200, {"version": "0.5.7"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["model"], "llama3.2:1b")
+        self.assertEqual(out["models_served"], ["llama3.2:1b"])
+        sigs = probe.detect_sigs(d["endpoints"])
+        self.assertEqual(sigs["ollama"]["model_meta"]["llama3.2:1b"],
+                         {"parameter_size": "1.24B", "quantization": "Q4_K_M"})
+
+
+class InventoryHashTest(unittest.TestCase):
+    def test_same_models_different_product_differ(self):
+        # identical model list, different framework -> different fleet hash
+        vllm = make_dossier({
+            "/version": ep(200, {"version": "v0.6.6", "app_name": "vLLM"}),
+            "/v1/models": ep(200, {"data": [{"id": "gpt-4o", "owned_by": "x"}]},
+                             headers={"server": "vllm/0.6.6"}),
+        })
+        compat = make_dossier({
+            "/v1/models": ep(200, {"data": [{"id": "gpt-4o", "owned_by": "x"}]},
+                             headers={"server": "nginx"}),
+        })
+        a, b = probe.analyze(vllm), probe.analyze(compat)
+        self.assertEqual(a["models_served"], b["models_served"])
+        self.assertNotEqual(a["inventory_hash"], b["inventory_hash"])
+
+    def test_version_contributes_to_hash(self):
+        def mk(ver):
+            return probe.analyze(make_dossier({
+                "/version": ep(200, {"version": ver, "app_name": "vLLM"}),
+                "/v1/models": ep(200, {"data": [{"id": "Qwen-7B"}]},
+                                 headers={"server": "vllm/0.6.6"}),
+            }))
+        self.assertNotEqual(mk("v0.6.1")["inventory_hash"],
+                            mk("v0.6.2")["inventory_hash"])
+
+    def test_hash_stable_across_runs(self):
+        d = make_dossier({
+            "/version": ep(200, {"version": "v0.6.6", "app_name": "vLLM"}),
+            "/v1/models": ep(200, {"data": [{"id": "Qwen-7B"}, {"id": "A-1B"}]},
+                             headers={"server": "vllm/0.6.6"}),
+        })
+        self.assertEqual(probe.analyze(d)["inventory_hash"],
+                         probe.analyze(d)["inventory_hash"])
+
+    def test_same_surface_same_framework_same_hash(self):
+        # identical framework + models -> identical hash (fleet clustering works)
+        def mk():
+            return probe.analyze(make_dossier({
+                "/version": ep(200, {"version": "v0.6.6", "app_name": "vLLM"}),
+                "/v1/models": ep(200, {"data": [{"id": "Qwen-7B"}]},
+                                 headers={"server": "vllm/0.6.6"}),
+            }))
+        self.assertEqual(mk()["inventory_hash"], mk()["inventory_hash"])
+
+
+class ProxyInventoryTest(unittest.TestCase):
+    def test_litellm_suppresses_impossible_inventory(self):
+        # a LiteLLM proxy legitimately fronts OpenAI + Anthropic: conflicting
+        # vendors must NOT flip IMPOSTOR, only an informational flag
+        d = make_dossier({
+            "/health/liveliness": ep(200, None, "LIVE"),
+            "/models": ep(200, ["gpt-4o-mini", "claude-3-haiku"]),
+            "/v1/models": ep(200, {"data": [
+                {"id": "gpt-4o", "owned_by": "openai"},
+                {"id": "claude-3", "owned_by": "anthropic"},
+            ]}),
+        })
+        out = probe.analyze(d)
+        self.assertIn("litellm", out["product"])
+        self.assertEqual(out["verdict"], "GENUINE")
+        self.assertIn("PROXY_INVENTORY", flag_names(out))
+        self.assertNotIn("IMPOSSIBLE_INVENTORY", flag_names(out))
+        self.assertEqual(out["score"], 0)  # informational: weightless
+        self.assertNotIn("PROXY_INVENTORY", out["score_reasons"])
+
+    def test_frontend_suppresses_impossible_inventory(self):
+        # Open WebUI multiplexing OpenAI + Anthropic is a legit stack too
+        d = make_dossier({
+            "/api/version": ep(200, {"version": "0.5.8"}),
+            "/api/config": ep(200, {"status": True}),
+            "/v1/models": ep(200, {"data": [
+                {"id": "gpt-4o", "owned_by": "openai"},
+                {"id": "claude-3", "owned_by": "anthropic"},
+            ]}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["verdict"], "GENUINE")
+        self.assertIn("PROXY_INVENTORY", flag_names(out))
+        self.assertNotIn("IMPOSSIBLE_INVENTORY", flag_names(out))
+
+
+class HoneypotHeuristicsTest(unittest.TestCase):
+    # --- MISSING_SERVER_HEADER ---
+    def test_missing_server_header_positive(self):
+        d = make_dossier({"/v1/models": ep(200, {"data": [{"id": "gpt-4o-mini"}]})})
+        out = probe.analyze(d)
+        self.assertIn("MISSING_SERVER_HEADER", flag_names(out))
+        self.assertEqual(out["score"], 15)
+
+    def test_missing_server_header_negative_with_server_header(self):
+        d = make_dossier({"/v1/models": ep(200, {"data": [{"id": "gpt-4o-mini"}]},
+                                           headers={"server": "nginx"})})
+        out = probe.analyze(d)
+        self.assertNotIn("MISSING_SERVER_HEADER", flag_names(out))
+        self.assertEqual(out["score"], 0)
+
+    def test_missing_server_header_negative_with_version(self):
+        d = make_dossier({
+            "/version": ep(200, {"version": "0.6.6", "app_name": "vLLM"}),
+            "/v1/models": ep(200, {"data": [{"id": "Qwen-7B"}]}),
+        })
+        out = probe.analyze(d)
+        self.assertNotIn("MISSING_SERVER_HEADER", flag_names(out))
+
+    # --- IMPOSSIBLE_LATENCY ---
+    def test_impossible_latency_positive(self):
+        d = make_dossier({"/v1/models": ep(200, {"data": [{"id": "x"}]},
+                                           headers={"server": "nginx"})})
+        d["latency_ms"] = 2
+        out = probe.analyze(d)
+        self.assertIn("IMPOSSIBLE_LATENCY", flag_names(out))
+        self.assertEqual(out["score"], 30)
+
+    def test_impossible_latency_negative_normal_latency(self):
+        d = make_dossier({"/v1/models": ep(200, {"data": [{"id": "x"}]},
+                                           headers={"server": "nginx"})})
+        d["latency_ms"] = 120
+        out = probe.analyze(d)
+        self.assertNotIn("IMPOSSIBLE_LATENCY", flag_names(out))
+
+    def test_impossible_latency_suppressed_on_localhost(self):
+        d = make_dossier({"/v1/models": ep(200, {"data": [{"id": "x"}]})})
+        d["latency_ms"] = 1
+        d["target"] = "127.0.0.1:11434"
+        out = probe.analyze(d)
+        self.assertNotIn("IMPOSSIBLE_LATENCY", flag_names(out))
+
+    def test_impossible_latency_absent_when_no_latency(self):
+        d = make_dossier({"/v1/models": ep(200, {"data": [{"id": "x"}]})})
+        d["latency_ms"] = None
+        out = probe.analyze(d)
+        self.assertNotIn("IMPOSSIBLE_LATENCY", flag_names(out))
+
+    # --- CANNED_BANNER ---
+    def test_canned_banner_positive(self):
+        d = make_dossier({
+            "/": ep(200, None,
+                    "<html><head><title>vLLM — Serving</title></head></html>"),
+            "/version": ep(404, None, "not found"),
+            "/v1/models": ep(404, None, "not found"),
+            "/api/tags": ep(404, None, "not found"),
+            "/props": ep(404, None, "not found"),
+        })
+        out = probe.analyze(d)
+        self.assertIn("CANNED_BANNER", flag_names(out))
+        self.assertEqual(out["score"], 20)
+
+    def test_canned_banner_negative_distinct_bodies(self):
+        d = make_dossier({
+            "/": ep(200, None,
+                    "<html><head><title>vLLM — Serving</title></head></html>"),
+            "/version": ep(404, None, "not found A"),
+            "/v1/models": ep(404, None, "not found B"),
+            "/api/tags": ep(404, None, "not found C"),
+            "/props": ep(404, None, "not found D"),
+        })
+        out = probe.analyze(d)
+        self.assertNotIn("CANNED_BANNER", flag_names(out))
+
+    def test_canned_banner_negative_no_title(self):
+        d = make_dossier({
+            "/": ep(200, None, "vllm serving multiple models"),
+            "/version": ep(404, None, "not found"),
+            "/v1/models": ep(404, None, "not found"),
+            "/api/tags": ep(404, None, "not found"),
+        })
+        out = probe.analyze(d)
+        self.assertNotIn("CANNED_BANNER", flag_names(out))
+
+
+class ScoreReasonsTest(unittest.TestCase):
+    def test_score_reasons_list_scored_flags(self):
+        d = make_dossier({
+            "/": ep(200, None, "some app"),
+            "/api/tags": ep(200, {"models": [{"name": "llama3"}]}),
+            "/props": ep(200, {"model_path": "/m.gguf"}),
+            "/v1/models": ep(200, {"data": [
+                {"id": "gpt-4", "owned_by": "openai"},
+                {"id": "claude-3", "owned_by": "anthropic"},
+            ]}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["score"], 100)  # capped at 100
+        for name in ("WEAK_OLLAMA", "FAKE_LLAMACPP", "MULTI_PERSONA",
+                     "IMPOSSIBLE_INVENTORY"):
+            self.assertIn(name, out["score_reasons"])
+        self.assertEqual(len(out["score_reasons"]),
+                         len(set(out["score_reasons"])))  # no duplicates
+
+    def test_no_flags_gives_empty_reasons(self):
+        d = make_dossier({
+            "/version": ep(200, {"version": "v0.6.6", "app_name": "vLLM"}),
+            "/v1/models": ep(200, {"data": [{"id": "Qwen-7B"}]},
+                             headers={"server": "vllm/0.6.6"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["score_reasons"], [])
+        self.assertEqual(out["score"], 0)
 
 
 if __name__ == "__main__":

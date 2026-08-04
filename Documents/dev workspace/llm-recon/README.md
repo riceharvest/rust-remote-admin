@@ -56,6 +56,10 @@ python3 -m srecon <command> [options]
 
   scan         Run a scan against targets
   serve        Start the web console
+  report       Render an offline report (HTML / Markdown / CSV / JSON)
+  scans        List scan sessions (UTC times, verdict counts)
+  diff         Compare two scan sessions' target rows (NEW / GONE / CHANGED)
+  import       Ingest an offline Shodan/Censys export into the history DB
   packs        List cloud provider target packs
   frameworks   List known LLM serving frameworks and their ports
   prefixes     Resolve ASN(s) to announced IPv4 prefixes
@@ -163,6 +167,74 @@ python3 -m srecon prefixes --asn 24940 --limit 100
 # Resolve a country to delegated IPv4 ranges (via RIR stats)
 python3 -m srecon cidrs --cc DE --limit 64
 ```
+
+### `scan` history: `scans`, `diff`, `import`
+
+Every `scan` run records a session row in the history DB (`srecon/data/state.db`,
+`scans` table) with start/finish UTC timestamps, target count, run params
+(`params_json`) and verdict counts (`stats_json`). The `scans` command lists
+them:
+
+```bash
+# All sessions, newest first (human table)
+python3 -m srecon scans
+
+# Only the 5 most recent, as NDJSON (one object per line)
+python3 -m srecon scans --last 5 --json
+```
+
+`diff` compares two session IDs' target rows and groups them into **NEW**
+(in B not A), **GONE** (in A not B) and **CHANGED** (same target, changed
+verdict/product/model-set/version), with a summary count line. Changes are
+detected from the rich columns now persisted (model, models_served, version,
+verify_result, latency_ms, asn, …); when either row of a pair lacks model data
+(a legacy row), the model-change is reported as `unknown` rather than false.
+
+```bash
+python3 -m srecon diff 1 2              # human grouped output
+python3 -m srecon diff 1 2 --json       # machine-readable
+```
+
+> Note: the `targets` table persists only the last recorded row per `ip:port`
+> (PRIMARY KEY, INSERT OR REPLACE), so two live sessions share a target only
+> where the newer scan has not re-recorded it — CHANGED is thus detected across
+> snapshots that both retained the target.
+
+`import` ingests an exported Shodan (JSONL) or Censys (JSON/CSV) dataset without
+probing — imported rows are always `UNKNOWN` verdict and tagged with an
+`IMPORTED_*` flag. It wraps `srecon/imports.py` (whose standalone entry point
+`python3 -m srecon.imports` keeps working):
+
+```bash
+python3 -m srecon import shodan.jsonl --format shodan --scan-id 3
+python3 -m srecon import censys.csv --dry-run          # parse only, no DB write
+```
+
+### `report` — offline rendering
+
+`report` renders results from a `scan -o` JSON file or directly from the
+history DB. Full history (no source flags), a specific session, or a file:
+
+```bash
+python3 -m srecon report                      # full history, HTML (stdout)
+python3 -m srecon report --scan-id 5 --format md -o report.md
+python3 -m srecon report --input results.json --format csv
+python3 -m srecon report --scan-id 5 --format json --scans
+```
+
+| Flag | Description |
+|---|---|
+| `-i, --input FILE` | Results JSON file as produced by `scan -o` |
+| `--scan-id N` | Render the rows recorded for scan session N |
+| `--format html\|md\|csv\|json` | Output format (default `html`) |
+| `--scans` | Embed the scan-session list as a header section (params pretty-printed) in a DB report |
+| `-o, --output FILE` | Write to FILE (default stdout) |
+
+When the source rows carry the richer columns (model, version, verify_result,
+latency_ms, asn, …), the report table includes them; the HTML report adds a
+**Verify** badge column. `--format json` emits the full normalized result rows,
+the summary, and (with `--scans`) the decoded scan-session list as a single JSON
+document.
 
 ---
 

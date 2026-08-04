@@ -6,6 +6,7 @@ import json
 import queue
 import random
 import resource
+import sys
 import threading
 import time
 
@@ -25,6 +26,86 @@ from .net import (
 from .targets import expand_targets, parse_excludes
 from .asn import bulk_asn_lookup, asn_lookup
 from .probe import analyze, detect_sigs, verify_inference
+
+# ---------- engine robustness constants ----------
+# These bound worst-case per-host behaviour so a single hostile host (slow-rolling
+# server, hang in a thread-backed lookup, etc.) can never stall a worker slot or
+# the whole scan indefinitely.
+# Per-exchange overall deadline: the socket timeout applies per I/O op, so a
+# server trickling bytes could otherwise hold a worker for N*timeout. We bound
+# the whole probe_host exchange at timeout * max(4, len(paths)).
+DEADLINE_PATHS_FLOOR = 4
+# Verification (a 45s cold-start inference POST) gets its own bounded concurrency
+# so a queue of verifies can never steal scan-worker slots from probing.
+VERIFY_WORKERS = 32
+# Bulk ASN flush runs whois/RDAP in an executor thread; guard it against hanging
+# (and outliving a cancel) with an overall budget.
+FLUSH_ASN_TIMEOUT = 60.0
+# Bounded wait for the engine thread to exit cooperatively after a cancel. It
+# can never outlive forever — probe_host cancellation unwinds at the next await.
+ENGINE_JOIN_TIMEOUT = 20.0
+# Network/parsing failures we expect from probe_host are surfaced as ordinary
+# DARK/ERROR results. *Anything else* (TypeError, KeyError, AttributeError, ...)
+# is an engine bug: it is counted + logged separately (engine_error) instead of
+# being silently rewritten into an ERROR result that hides the defect.
+_EXPECTED_NET_EXC = (OSError, asyncio.TimeoutError, ValueError)
+
+
+def _overall_deadline(timeout, npaths):
+    """Overall per-host exchange budget = timeout * max(DEADLINE_PATHS_FLOOR, npaths).
+
+    A slow-rolling server outlasts the per-op socket timeout one I/O at a time;
+    bounding the whole probe_host exchange in this deadline guarantees one host
+    can never hold a worker slot for more than timeout * npaths seconds.
+    """
+    return timeout * max(DEADLINE_PATHS_FLOOR, npaths)
+
+
+def _adaptive_timeout_step(original_timeout, cur_timeout, p50_ms=None,
+                           p95_ms=None, timeout_share=None, floor=1.0,
+                           regrow_at=0.5, regrow_err=0.25, regrow_step=2.0):
+    """One step of the adaptive-timeout controller (pure, testable).
+
+    Shrink: pull cur_timeout toward 3x P95 when latency samples exist,
+    floored at `floor` and never exceeding the original.
+
+    Regrow: when the timeout was shrunk and either recent P50 latency has
+    climbed to >= `regrow_at` of the shrunk value (the safety slack is gone)
+    or the share of recently-timed-out probes exceeds `regrow_err`, grow back
+    toward the original in `regrow_step` increments, capped at the original.
+
+    Order matters: regrowth is decided before shrink so a transient latency
+    spike cannot be immediately re-collapsed.
+    """
+    if cur_timeout >= original_timeout:
+        return original_timeout
+    # regrowth signals take priority over shrinking
+    if p50_ms is not None and p50_ms / 1000.0 >= regrow_at * cur_timeout:
+        return min(original_timeout, cur_timeout + regrow_step)
+    if timeout_share is not None and timeout_share >= regrow_err:
+        return min(original_timeout, cur_timeout + regrow_step)
+    # shrink toward 3x P95 once we have latency signal
+    if p95_ms is not None:
+        return max(floor, min(original_timeout, 3.0 * p95_ms / 1000.0))
+    return cur_timeout
+
+
+def _error_dossier(target, verdict, error):
+    """A minimal dossier for a host that failed before any HTTP exchange."""
+    return {
+        "target": target, "product": "unknown", "verdict": verdict,
+        "version": None, "model": None, "models_served": [], "flags": [],
+        "endpoints": {}, "latency_ms": None, "error": error,
+        "asn": None, "as_name": None, "bgp_prefix": None, "net_type": None,
+        "score": 0, "inventory_hash": None, "ptr": None,
+        "verify_result": None, "verify_detail": None,
+    }
+
+
+def _warn(msg):
+    """Warn to stderr from a generator/thread context where no logger exists."""
+    print(msg, file=sys.stderr)
+
 
 # ---------- async probe engine ----------
 # discriminator paths always run (multi-persona detection depends on them);
@@ -141,7 +222,7 @@ def _aux_needed(path, ep, sigs):
 
 async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
                      content_hashes=None, banner_prefilter=False,
-                     ptr_seed=False, diff_mode=False, verify=False):
+                     ptr_seed=False, diff_mode=False, conn_registry=None):
     dossier = {
         "target": f"{host}:{port}", "product": "unknown", "verdict": "DARK",
         "version": None, "model": None, "models_served": [], "flags": [],
@@ -172,6 +253,10 @@ async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
             _Conn.open(host, port, min(timeout, CONNECT_TIMEOUT))
             for _ in range(nconns)))
         conns = list(conns)
+        if conn_registry is not None:
+            # register live sockets so a cancellation/timeout mid-exchange can
+            # still close them via the caller's registry instead of leaking fd.
+            conn_registry.update(conns)
     except Exception as e:
         first_err = type(e).__name__
         conns = []
@@ -214,25 +299,16 @@ async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
     await wave(aux)
     for c in conns:
         c.close()
+    if conn_registry is not None:
+        conn_registry.difference_update(conns)
     dossier["latency_ms"] = round((time.time() - t0) * 1000)
     if not any(v["status"] is not None for v in endpoints.values()):
         dossier["error"] = "no response"
         return dossier
     d = await asyncio.to_thread(analyze, dossier)
-    # deep verify: POST a tiny generate to confirm real inference (not stub/auth)
-    if verify and d["verdict"] in ("GENUINE", "UNKNOWN"):
-        vr, vd = await asyncio.to_thread(
-            verify_inference, host, port, detect_sigs(endpoints))
-        d["verify_result"] = vr
-        d["verify_detail"] = vd
-        if vr == "honeypot":
-            d["verdict"] = "IMPOSTOR"
-            d["flags"] = list(d.get("flags") or []) + ["HONEYPOT_STUB: canned empty response"]
-            d["score"] = d.get("score", 0) + 50
-        elif vr == "auth-walled":
-            d["flags"] = list(d.get("flags") or []) + ["AUTH_WALLED: inference requires ollama.com account"]
-        elif vr == "live":
-            d["flags"] = list(d.get("flags") or []) + ["INFERENCE_CONFIRMED"]
+    # NOTE: inference verification is intentionally NOT done here. It runs a
+    # 45s-cold-start POST that must not hold a scan worker slot, so the caller
+    # (run_async_engine.bound) performs it under its own bounded semaphore.
     # content dedup: hash the identifying surface; on >=3 byte-identical
     # responses tag as DUPLICATE_CDN so the UI can collapse the cluster.
     if content_hashes is not None and d["verdict"] not in ("DARK", "ERROR"):
@@ -265,11 +341,23 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
 
     async def main():
         sem = asyncio.Semaphore(workers)
+        # verification has its own bounded concurrency so 45s cold-start POSTs
+        # never steal scan-worker slots from live probing.
+        verify_sem = asyncio.Semaphore(VERIFY_WORKERS)
+        # live sockets opened by in-flight probe_host coroutines. Registered so
+        # that a cancel/timeout can close them instead of leaking file descriptors.
+        live_conns = set()
+        # counter for unexpected (non-network) engine exceptions; distinct from
+        # DARK/ERROR verdict accounting so engine bugs are never silently masked.
+        engine_err_count = [0]
         pending = []  # (ip, target) awaiting bulk ASN enrichment
         seen_fanout = set()  # avoid duplicate fanout probes
-        # adaptive timeout: track live latencies, shrink to 3x P95
+        # adaptive timeout: track live latencies, shrink to 3x P95 on latency
+        # pressure and regrow toward the original when slack runs out.
         cur_timeout = [timeout]
         lat_samples = []
+        recent_lats = collections.deque(maxlen=100)  # recent live latencies (P50)
+        recent_to = collections.deque(maxlen=100)    # recent did-it-timeout flags
         # content dedup: signature -> count; >=3 identical = cluster
         sig_counts = {}
         ptr_seen = set()
@@ -277,9 +365,21 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
         async def flush_asn():
             if not pending:
                 return
+            if cancel is not None and cancel.is_set():
+                pending[:] = []
+                return
             batch, pending[:] = pending[:], []
             ips = list({ip for ip, _t in batch})
-            res = await asyncio.to_thread(bulk_asn_lookup, ips)
+            try:
+                # bulk whois/RDAP runs in an executor thread with no per-op
+                # bound of its own; wrap it in an overall budget and treat a
+                # cancel as a reason to abort rather than flush.
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(bulk_asn_lookup, ips), FLUSH_ASN_TIMEOUT)
+            except asyncio.TimeoutError:
+                res = {}
+            except _EXPECTED_NET_EXC:
+                res = {}
             for ip, target in batch:
                 info = res.get(ip)
                 if info is None:  # straggler: per-IP DNS fallback
@@ -297,40 +397,112 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
         async def flusher():
             while True:
                 await asyncio.sleep(4)
+                if cancel is not None and cancel.is_set():
+                    return
                 await flush_asn()
 
         async def bound(h, p, is_fanout=False):
-            async with sem:
-                if cancel is not None and cancel.is_set():
-                    return None
-                tgt = f"{h}:{p}"
-                if tgt in skip_set or tgt in blocklist:
-                    return None
-                try:
-                    d = await probe_host(
-                        h, p, paths, cur_timeout[0], probe_cb, fast,
-                        fanout=is_fanout, content_hashes=(sig_counts if content_dedup else None),
-                        banner_prefilter=banner_prefilter,
-                        ptr_seed=ptr_seed, diff_mode=diff_mode, verify=verify)
+            if cancel is not None and cancel.is_set():
+                return None
+            tgt = f"{h}:{p}"
+            if tgt in skip_set or tgt in blocklist:
+                return None
+            # conns opened by *this* probe; anything residual after it returns
+            # (its registry cleanup was skipped by a cancel/timeout/exception)
+            # must be closed so fd usage stays bounded per host.
+            prev_conns = set(live_conns)
+            d = None
+            err = None
+            try:
+                async with sem:
+                    d = await asyncio.wait_for(
+                        probe_host(
+                            h, p, paths, cur_timeout[0], probe_cb, fast,
+                            fanout=is_fanout,
+                            content_hashes=(sig_counts if content_dedup else None),
+                            banner_prefilter=banner_prefilter,
+                            ptr_seed=ptr_seed, diff_mode=diff_mode,
+                            conn_registry=live_conns),
+                        _overall_deadline(timeout, len(paths)))
                     # normalize tuple return (fanout yields (d, neighbors))
                     if isinstance(d, tuple):
                         d = d[0]
-                except Exception as e:
-                    d = {"target": tgt, "product": "unknown", "verdict": "ERROR",
-                         "error": str(e), "flags": [], "endpoints": {},
-                         "models_served": [], "version": None, "model": None,
-                         "latency_ms": None, "asn": None, "as_name": None,
-                         "bgp_prefix": None, "net_type": None,
-                         "score": 0, "inventory_hash": None, "ptr": None}
-                return d
+            except asyncio.TimeoutError:
+                err = "exchange timeout"
+            except _EXPECTED_NET_EXC as e:
+                err = f"{type(e).__name__}: {e}"
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Unexpected exception type => engine bug, not a failed host.
+                # Count + log it separately; do NOT rewrite into DARK/ERROR.
+                engine_err_count[0] += 1
+                q.put({"type": "engine_error", "target": tgt,
+                       "exc_type": type(e).__name__, "message": str(e),
+                       "count": engine_err_count[0]})
+            finally:
+                # close any sockets this probe leaked (overall-deadline timeout,
+                # expected network error, or unexpected exception unwound it)
+                leaked = live_conns - prev_conns
+                for c in list(leaked):
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                    live_conns.discard(c)
+            if d is None:
+                if err is None:
+                    return None  # engine error already logged above
+                d = _error_dossier(tgt, "DARK" if err == "exchange timeout"
+                                   else "ERROR", err)
+            # deep verify runs OUTSIDE the scan semaphore, under its own bounded
+            # concurrency: a 45s cold-start POST must not stall scan workers.
+            if verify and d["verdict"] in ("GENUINE", "UNKNOWN"):
+                async with verify_sem:
+                    if cancel is not None and cancel.is_set():
+                        return d
+                    try:
+                        vr, vd = await asyncio.to_thread(
+                            verify_inference, h, p,
+                            detect_sigs(d.get("endpoints") or {}))
+                        d["verify_result"] = vr
+                        d["verify_detail"] = vd
+                        if vr == "honeypot":
+                            d["verdict"] = "IMPOSTOR"
+                            d["flags"] = list(d.get("flags") or []) + ["HONEYPOT_STUB: canned empty response"]
+                            d["score"] = d.get("score", 0) + 50
+                        elif vr == "auth-walled":
+                            d["flags"] = list(d.get("flags") or []) + ["AUTH_WALLED: inference requires ollama.com account"]
+                        elif vr == "live":
+                            d["flags"] = list(d.get("flags") or []) + ["INFERENCE_CONFIRMED"]
+                    except asyncio.CancelledError:
+                        raise
+                    except _EXPECTED_NET_EXC as e:
+                        # verify network failure: keep the base dossier untouched
+                        d.setdefault("flags", [])
+                        d["flags"] = list(d["flags"]) + [f"VERIFY_{type(e).__name__}"]
+                    except Exception as e:
+                        engine_err_count[0] += 1
+                        q.put({"type": "engine_error", "target": tgt,
+                               "exc_type": type(e).__name__, "message": str(e),
+                               "count": engine_err_count[0]})
+            return d
 
         fl = asyncio.create_task(flusher())
         tasks = [asyncio.ensure_future(bound(h, p)) for h, p in targets]
         task_set = set(tasks)
         for fut in asyncio.as_completed(task_set):
             if cancel is not None and cancel.is_set():
+                # cooperative cancellation: cancel pending probe tasks and close
+                # any sockets they may have opened before unwinding the loop.
                 for t in task_set:
                     t.cancel()
+                for c in list(live_conns):
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                live_conns.clear()
                 fl.cancel()
                 return
             try:
@@ -342,13 +514,24 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
             ip, port_s = d["target"].rsplit(":", 1)
             port = int(port_s)
             live = d["verdict"] not in ("DARK", "ERROR")
-            # adaptive timeout: shrink to 3x P95 once we have samples
-            if adaptive_timeout and d.get("latency_ms") is not None and live:
-                lat_samples.append(d["latency_ms"])
+            # adaptive timeout: shrink to 3x P95 on latency pressure; regrow
+            # toward the original when P50 climbs or the timeout rate spikes.
+            if adaptive_timeout:
+                if d.get("latency_ms") is not None and live:
+                    lat_samples.append(d["latency_ms"])
+                    recent_lats.append(d["latency_ms"])
+                recent_to.append(1 if "timeout" in (d.get("error") or "").lower() else 0)
+                p50, p95 = None, None
+                if len(recent_lats) >= 25:
+                    _srt = sorted(recent_lats)
+                    p50 = _srt[len(_srt) // 2]
                 if len(lat_samples) >= 200:
-                    srt = sorted(lat_samples)
-                    p95 = srt[int(len(srt) * 0.95)]
-                    cur_timeout[0] = max(1.0, min(timeout, 3 * p95 / 1000.0))
+                    _srt = sorted(lat_samples)
+                    p95 = _srt[int(len(_srt) * 0.95)]
+                to_share = sum(recent_to) / len(recent_to) if recent_to else None
+                cur_timeout[0] = _adaptive_timeout_step(
+                    timeout, cur_timeout[0], p50_ms=p50, p95_ms=p95,
+                    timeout_share=to_share)
             # PTR enrichment on first live hit per IP (fire-and-forget: DNS
             # lookups take 1-5s and must NOT block the as_completed loop)
             if ptr_seed and live and ip not in ptr_seen:
@@ -645,6 +828,15 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
             elif ev["type"] == "enrich_done":
                 engine_done = True
                 continue  # internal marker, not streamed
+            elif ev["type"] == "engine_error":
+                # engine bug (unexpected exception type), surfaced loudly rather
+                # than being hidden as a DARK/ERROR result. Counted separately.
+                yield {"type": "log",
+                       "message": f"ENGINE ERROR #{ev.get('count')} @ "
+                                  f"{ev.get('target')}: {ev.get('exc_type')}: "
+                                  f"{ev.get('message', '')}",
+                       "cls": "error"}
+                continue
             yield ev
     except Exception as e:
         # engine failure mid-scan: still close the scan row, flagged with error
@@ -654,7 +846,20 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
                               "status": "error", "error": str(e)})
         raise
     finally:
-        eng.join(timeout=5)
+        # Cooperative cancellation: flip the cancel flag so run_async_engine's
+        # loop can cancel its pending asyncio tasks and close open sockets, then
+        # wait a bounded time. The engine thread is daemonic and self-terminates
+        # at the next await, but a hung to_thread (e.g. 45s cold-start verify)
+        # can outlive even this; warn loudly instead of blocking the caller.
+        if cancel is not None:
+            cancel.set()
+        try:
+            eng.join(timeout=ENGINE_JOIN_TIMEOUT)
+        finally:
+            if eng.is_alive():
+                _warn(f"[engine] scan {scan_id} engine thread still alive after "
+                      f"{ENGINE_JOIN_TIMEOUT:.0f}s cancel grace; leaving it to "
+                      f"finish and close its own sockets in the background.")
     el = round(time.time() - t0, 1)
     hps = round(got / el, 1) if el else 0
     finish_scan(scan_id, {"requests": reqs[0], "elapsed_s": el,

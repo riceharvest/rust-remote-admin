@@ -44,6 +44,21 @@ CSV_COLUMNS = [
     "latency_ms", "asn", "as_name", "bgp_prefix", "net_type", "ptr", "flags",
 ]
 
+# Rich dropped-field columns the targets table may carry (schema v2). Selected
+# dynamically in load_db_results so legacy v0 tables (no such columns) still
+# load — the fields are simply absent from those rows.
+_RICH_COLUMNS = [
+    "model", "models_served", "version", "verify_result", "verify_detail",
+    "latency_ms", "asn", "as_name", "bgp_prefix", "net_type", "error",
+]
+
+# Canonical JSON result fields, in display order, for render_json / diff rows.
+_RESULT_COLUMNS = [
+    "target", "verdict", "product", "version", "model", "models_served",
+    "score", "latency_ms", "verify_result", "verify_detail",
+    "asn", "as_name", "bgp_prefix", "net_type", "ptr", "flags", "error",
+]
+
 
 # --------------------------------------------------------------------------
 # loaders
@@ -81,6 +96,11 @@ def load_db_results(scan_id=None, db_path=None):
     (schema v2+). On legacy v0 DBs without a ``scan_id`` column, falls back to
     the single ``targets`` row whose SQLite ``rowid`` is N.
 
+    Every result carries the rich dropped-field columns when the underlying
+    table has them (model, models_served, version, verify_result, latency_ms,
+    asn, as_name, bgp_prefix, net_type, error) — legacy tables simply omit
+    them, so renderers/diff tolerate missing keys.
+
     Raises ``FileNotFoundError`` if the DB file does not exist and
     ``ValueError`` if a requested scan_id is not present.
     """
@@ -93,36 +113,50 @@ def load_db_results(scan_id=None, db_path=None):
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(targets)")}
         has_scan_id = "scan_id" in cols
+        rich = sorted(c for c in _RICH_COLUMNS if c in cols)
+        base = ["rowid", "ip", "port", "verdict", "product", "score",
+                "scanned_at", "fp"]
+        sel = base + rich
+        col_sql = ", ".join(sel)
         if scan_id is None:
             rows = conn.execute(
-                "SELECT rowid, ip, port, verdict, product, score, scanned_at, fp "
-                "FROM targets ORDER BY scanned_at DESC, ip, port").fetchall()
+                f"SELECT {col_sql} FROM targets "
+                f"ORDER BY scanned_at DESC, ip, port").fetchall()
         elif has_scan_id:
             rows = conn.execute(
-                "SELECT rowid, ip, port, verdict, product, score, scanned_at, fp "
-                "FROM targets WHERE scan_id = ? "
-                "ORDER BY ip, port", (int(scan_id),)).fetchall()
+                f"SELECT {col_sql} FROM targets WHERE scan_id = ? "
+                f"ORDER BY ip, port", (int(scan_id),)).fetchall()
             if not rows:
                 raise ValueError(f"no history rows for scan_id {scan_id} in {db_path}")
         else:
             rows = conn.execute(
-                "SELECT rowid, ip, port, verdict, product, score, scanned_at, fp "
-                "FROM targets WHERE rowid = ?", (int(scan_id),)).fetchall()
+                f"SELECT {col_sql} FROM targets WHERE rowid = ?",
+                (int(scan_id),)).fetchall()
             if not rows:
                 raise ValueError(f"no history row with id {scan_id} in {db_path}")
     finally:
         conn.close()
     results = []
-    for rowid, ip, port, verdict, product, score, scanned_at, fp in rows:
-        results.append({
-            "target": f"{ip}:{port}",
-            "verdict": verdict or "DARK",
-            "product": product or "",
-            "score": score or 0,
-            "scanned_at": scanned_at,
-            "fp": fp or "",
-            "_rowid": rowid,
-        })
+    for item in rows:
+        d = dict(zip(sel, item))
+        r = {
+            "target": f"{d['ip']}:{d['port']}",
+            "verdict": d.get("verdict") or "DARK",
+            "product": d.get("product") or "",
+            "score": d.get("score") or 0,
+            "scanned_at": d.get("scanned_at"),
+            "fp": d.get("fp") or "",
+            "_rowid": d.get("rowid"),
+        }
+        for c in rich:
+            v = d.get(c)
+            if c == "models_served" and isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except (TypeError, ValueError):
+                    v = v
+            r[c] = v
+        results.append(r)
     meta = {"source": "sqlite history", "scan_id": scan_id}
     return results, meta
 
@@ -175,6 +209,269 @@ def _esc(value):
 
 
 # --------------------------------------------------------------------------
+# JSON report
+# --------------------------------------------------------------------------
+
+def _json_row(r):
+    """Normalize a result dict to the canonical JSON field set."""
+    row = {}
+    for k in _RESULT_COLUMNS:
+        v = r.get(k)
+        if k == "models_served" and isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except (TypeError, ValueError):
+                v = None
+        row[k] = v
+    return row
+
+
+def render_json(results, meta=None, scans=None):
+    """Render results + summary as a single JSON document.
+
+    ``scans`` (optional) is the raw scan-session list from ``db.list_scans()``;
+    when given it is embedded as a ``scans`` top-level key (params_json and
+    stats_json decoded).
+    """
+    out = {
+        "meta": dict(meta or {}),
+        "summary": summarize(results),
+        "results": [_json_row(r) for r in results],
+    }
+    if scans is not None:
+        out["scans"] = [_scan_meta_dict(s) for s in scans]
+    return json.dumps(out, indent=2, default=str)
+
+
+# --------------------------------------------------------------------------
+# scan-session views (scans subcommand + report --scans)
+# --------------------------------------------------------------------------
+
+def _parse_json(s):
+    """Decode a params_json/stats_json column, or None."""
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def scan_view(scan):
+    """Normalize a scans-table row (as returned by ``db.list_scans()``) into a
+    CLI-view dict: UTC timestamps, verdict counts parsed from stats_json, and a
+    status derived from finished_at + stats_json['status']."""
+    stats = _parse_json(scan.get("stats_json")) or {}
+    votes = stats.get("verdicts")
+    if not isinstance(votes, dict):
+        votes = {}
+    counts = {v: votes.get(v, 0) for v in VERDICTS}
+    if scan.get("finished_at") is None:
+        status = "running"
+    else:
+        status = stats.get("status") or "finished"
+        if status not in ("finished", "stopped", "error"):
+            status = "finished"
+    return {
+        "scan_id": scan["scan_id"],
+        "started": _fmt_scanned(scan.get("started_at")),
+        "finished": _fmt_scanned(scan.get("finished_at")),
+        "target_count": scan.get("target_count"),
+        "verdicts": counts,
+        "status": status,
+    }
+
+
+def render_scans_human(scans):
+    """Render scan sessions as a human-readable table (UTC timestamps)."""
+    header = (f"{'ID':<5} {'STARTED (UTC)':<18} {'FINISHED (UTC)':<18} "
+              f"{'TARGETS':>8} {'GENUINE':>7} {'IMPOSTOR':>8} {'UNKNOWN':>7} "
+              f"{'DARK':>5} {'ERROR':>5}  {'STATUS':<8}")
+    lines = [header, "-" * len(header)]
+    for s in scans:
+        v = s["verdicts"]
+        lines.append(
+            f"{s['scan_id']:<5} {s['started']:<18} {s['finished']:<18} "
+            f"{s['target_count'] if s['target_count'] is not None else '-':>8} "
+            f"{v['GENUINE']:>7} {v['IMPOSTOR']:>8} {v['UNKNOWN']:>7} "
+            f"{v['DARK']:>5} {v['ERROR']:>5}  {s['status']:<8}")
+    return "\n".join(lines)
+
+
+def _scan_meta_dict(s):
+    """Decoded scans-row dict for JSON embedding (report --scans / render_json)."""
+    return {
+        "scan_id": s.get("scan_id"),
+        "started": _fmt_scanned(s.get("started_at")),
+        "finished": _fmt_scanned(s.get("finished_at")),
+        "target_count": s.get("target_count"),
+        "params": _parse_json(s.get("params_json")),
+        "stats": _parse_json(s.get("stats_json")),
+    }
+
+
+def _html_scans_section(scans):
+    """HTML header section embedding the scan-session list (params pretty-printed)."""
+    rows = []
+    for s in scans:
+        params = _parse_json(s.get("params_json"))
+        params_html = _esc(json.dumps(params, indent=2, default=str)) if params else ""
+        rows.append(
+            f'<tr><td>{_esc(s.get("scan_id"))}</td>'
+            f'<td>{_esc(_fmt_scanned(s.get("started_at")))}</td>'
+            f'<td>{_esc(_fmt_scanned(s.get("finished_at")))}</td>'
+            f'<td class="num">{_esc(s.get("target_count") or "-")}</td>'
+            f'<td>{params_html}</td></tr>')
+    table = ("<table><thead><tr><th>Scan ID</th><th>Started (UTC)</th>"
+             "<th>Finished (UTC)</th><th>Targets</th><th>Params</th></tr></thead>"
+             f"<tbody>{''.join(rows)}</tbody></table>")
+    return f"<h2>Scan history</h2>\n{table}"
+
+
+def _md_scans_section(scans):
+    """Markdown header section embedding the scan-session list."""
+    lines = ["## Scan history", ""]
+    if not scans:
+        lines.append("_No scan sessions recorded._")
+        return "\n".join(lines)
+    lines.append(_md_table(
+        ["Scan ID", "Started (UTC)", "Finished (UTC)", "Targets", "Params"],
+        [[s.get("scan_id"), _fmt_scanned(s.get("started_at")),
+          _fmt_scanned(s.get("finished_at")),
+          s.get("target_count") if s.get("target_count") is not None else "",
+          json.dumps(_parse_json(s.get("params_json")) or {}, default=str)]
+         for s in scans]))
+    lines.append("")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# diff between two scan sessions
+# --------------------------------------------------------------------------
+
+def _models_set(row):
+    """Model-set of a result row: sorted set from models_served, else the
+    single model field, else None (legacy row with no model data)."""
+    served = row.get("models_served")
+    if isinstance(served, str):
+        try:
+            served = json.loads(served)
+        except (TypeError, ValueError):
+            served = [served]
+    if isinstance(served, (list, tuple)) and served:
+        return sorted({str(x) for x in served if x})
+    m = row.get("model")
+    if m:
+        return sorted({str(m)})
+    return None
+
+
+def classify_diff(rows_a, rows_b):
+    """Classify the difference between two target-row snapshots.
+
+    Pure function over two lists of result dicts (as produced by
+    ``load_db_results``). Returns a dict with ``new`` (present in B only),
+    ``gone`` (present in A only) and ``changed`` (same target, different
+    surface) lists plus a ``summary`` count line. A changed entry carries a
+    ``changes`` dict keyed by aspect: ``verdict``, ``product``, ``version``,
+    ``models``. When either row of a pair lacks model data (legacy rows),
+    ``changes['models']`` is the string ``"unknown"`` rather than a false
+    negative.
+
+    Note: the targets table persists only the last recorded row per ``ip:port``
+    (PRIMARY KEY, INSERT OR REPLACE), so two *live* scan sessions overlap only
+    where the newer scan has not re-recorded a shared target. Callers that need
+    to compare two historical snapshots of the same target can pass in-memory
+    snapshots directly.
+    """
+    am = {r["target"]: r for r in rows_a}
+    bm = {r["target"]: r for r in rows_b}
+
+    new = [bm[t] for t in sorted(bm.keys() - am.keys())]
+    gone = [am[t] for t in sorted(am.keys() - bm.keys())]
+    changed = []
+    for t in sorted(am.keys() & bm.keys()):
+        a, b = am[t], bm[t]
+        ch = {}
+        if (a.get("verdict") or "") != (b.get("verdict") or ""):
+            ch["verdict"] = [a.get("verdict"), b.get("verdict")]
+        if (a.get("product") or "") != (b.get("product") or ""):
+            ch["product"] = [a.get("product"), b.get("product")]
+        if (a.get("version") or "") != (b.get("version") or ""):
+            ch["version"] = [a.get("version"), b.get("version")]
+        aset, bset = _models_set(a), _models_set(b)
+        if aset is None or bset is None:
+            ch["models"] = "unknown"
+        elif aset != bset:
+            ch["models"] = [aset, bset]
+        if ch:
+            changed.append({
+                "target": t,
+                "from": _json_row(a),
+                "to": _json_row(b),
+                "changes": ch,
+            })
+    return {
+        "scan_a": None,
+        "scan_b": None,
+        "new": new,
+        "gone": gone,
+        "changed": changed,
+        "summary": {"new": len(new), "gone": len(gone), "changed": len(changed)},
+    }
+
+
+def diff_scans(scan_a, scan_b, db_path=None):
+    """Compare the target rows of two scan sessions by scan_id.
+
+    Loads each session's recorded target rows from the history DB and delegates
+    to :func:`classify_diff`.
+    """
+    ra, _ = load_db_results(scan_a, db_path)
+    rb, _ = load_db_results(scan_b, db_path)
+    d = classify_diff(ra, rb)
+    d["scan_a"] = scan_a
+    d["scan_b"] = scan_b
+    return d
+
+
+def _diff_row_line(r):
+    models = _models_set(r)
+    model_s = ",".join(models) if models else "-"
+    return (f"  {r.get('target'):<24} {(r.get('verdict') or '?'):<10} "
+            f"{(r.get('product') or '-'):<18} {model_s:<30} {r.get('version') or '-'}")
+
+
+def render_diff_human(d):
+    """Human-readable grouped diff output with a summary count line."""
+    out = [f"DIFF scan {d['scan_a']} -> scan {d['scan_b']}", ""]
+    out.append(f"NEW ({len(d['new'])}) — targets in B not in A:")
+    for r in d["new"]:
+        out.append(_diff_row_line(r))
+    out.append("")
+    out.append(f"GONE ({len(d['gone'])}) — targets in A not in B:")
+    for r in d["gone"]:
+        out.append(_diff_row_line(r))
+    out.append("")
+    out.append(f"CHANGED ({len(d['changed'])}) — same target, surface changed:")
+    for c in d["changed"]:
+        parts = []
+        for aspect, val in c["changes"].items():
+            if aspect == "models" and val == "unknown":
+                parts.append("model: unknown (no model data on one/both side)")
+            elif isinstance(val, list) and len(val) == 2:
+                parts.append(f"{aspect}: {val[0] or '-'} -> {val[1] or '-'}")
+            else:
+                parts.append(f"{aspect}: {val}")
+        out.append(f"  {c['target']}: " + "; ".join(parts))
+    s = d["summary"]
+    out.append("")
+    out.append(f"SUMMARY: {s['new']} new, {s['gone']} gone, {s['changed']} changed "
+               f"(scan {d['scan_a']} -> scan {d['scan_b']})")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
 # HTML report
 # --------------------------------------------------------------------------
 
@@ -213,6 +510,12 @@ tr:last-child td{border-bottom:none}
 .v-GENUINE{color:var(--good);font-weight:700} .v-IMPOSTOR{color:var(--bad);font-weight:700}
 .v-UNKNOWN{color:var(--warn)} .v-DARK{color:var(--dark)} .v-ERROR{color:var(--err)}
 .tag{display:inline-block;padding:1px 8px;border-radius:20px;font-size:11px;border:1px solid var(--border);background:var(--panel2);color:var(--muted)}
+.vbadge{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;border:1px solid var(--border);background:var(--panel2)}
+.vbadge.v-pass{color:var(--good);border-color:var(--good)}
+.vbadge.v-honeypot,.vbadge.v-fail,.vbadge.v-auth-walled{color:var(--bad);border-color:var(--bad)}
+.vbadge.v-live{color:var(--good);border-color:var(--good)}
+.vbadge.v-skipped{color:var(--muted)}
+pre{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow-x:auto;font-size:12px}
 .empty{color:var(--muted);padding:18px;text-align:center}
 .small{color:var(--muted);font-size:11px;margin-top:26px}
 """
@@ -302,6 +605,11 @@ def _html_table_rows(results):
         else:
             flags = "&mdash;"
         verdict = (r.get("verdict") or "UNKNOWN").upper()
+        verify = r.get("verify_result")
+        if verify:
+            badge = f'<span class="vbadge v-{_esc(str(verify).lower())}">{_esc(verify)}</span>'
+        else:
+            badge = "&mdash;"
 
         def _cell(value, cls=""):
             # escape first, then fall back to an em-dash placeholder so the
@@ -318,6 +626,7 @@ def _html_table_rows(results):
             "<tr>"
             + _cell(r.get("target"), "tv")
             + f'<td class="v-{_esc(verdict)}">{_esc(verdict)}</td>'
+            + f"<td>{badge}</td>"
             + _cell(r.get("product"))
             + _cell(r.get("version"))
             + _cell(r.get("model"))
@@ -352,7 +661,7 @@ def _html_asn_table(asns):
             f'<tbody>{rows}</tbody></table>')
 
 
-def render_html(results, meta=None):
+def render_html(results, meta=None, scans=None):
     """Render a self-contained dark-themed HTML report (inline CSS + JS)."""
     summary = summarize(results)
     meta = dict(meta or {})
@@ -360,7 +669,8 @@ def render_html(results, meta=None):
         meta["source"] = f"sqlite history ({STATE_DB})"
     rows_html = _html_table_rows(results)
     if not results:
-        rows_html = '<tr><td colspan="13" class="empty">No results recorded.</td></tr>'
+        rows_html = '<tr><td colspan="14" class="empty">No results recorded.</td></tr>'
+    scans_html = _html_scans_section(scans) if scans is not None else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -378,6 +688,7 @@ def render_html(results, meta=None):
   </div>
   <h2>Verdict distribution</h2>
 {_html_verdict_bars(summary)}
+{scans_html}
   <h2>Framework breakdown</h2>
 {_html_framework_table(summary["frameworks"])}
   <h2>Top ASNs</h2>
@@ -385,7 +696,7 @@ def render_html(results, meta=None):
   <h2>Results <span class="small">(click a column header to sort)</span></h2>
   <table id="results">
     <thead><tr>
-      <th>Target</th><th>Verdict</th><th>Product</th><th>Version</th><th>Model</th>
+      <th>Target</th><th>Verdict</th><th>Verify</th><th>Product</th><th>Version</th><th>Model</th>
       <th>Score</th><th>Latency</th><th>ASN</th><th>AS Name</th><th>BGP Prefix</th>
       <th>Net Type</th><th>PTR</th><th>Flags</th>
     </tr></thead>
@@ -418,7 +729,7 @@ def _md_table(headers, rows):
     return "\n".join(out)
 
 
-def render_markdown(results, meta=None):
+def render_markdown(results, meta=None, scans=None):
     """Render a Markdown summary report."""
     summary = summarize(results)
     meta = dict(meta or {})
@@ -437,6 +748,10 @@ def render_markdown(results, meta=None):
     meta_bits.append(f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("  \n".join(meta_bits))
     lines.append("")
+
+    if scans is not None:
+        lines.append(_md_scans_section(scans))
+        lines.append("")
 
     lines.append("## Summary")
     lines.append("")
@@ -509,13 +824,19 @@ def render_csv(results, meta=None):
 # dispatch
 # --------------------------------------------------------------------------
 
-def render_report(results, fmt="html", meta=None):
-    """Render ``results`` in the requested format: html, md or csv."""
+def render_report(results, fmt="html", meta=None, scans=None):
+    """Render ``results`` in the requested format: html, md, csv or json.
+
+    ``scans`` (optional scan-session list from ``db.list_scans()``) is embedded
+    as a header section for html/md and as a top-level ``scans`` key for json.
+    """
     fmt = (fmt or "html").lower()
     if fmt == "html":
-        return render_html(results, meta)
+        return render_html(results, meta, scans)
     if fmt == "md":
-        return render_markdown(results, meta)
+        return render_markdown(results, meta, scans)
     if fmt == "csv":
         return render_csv(results, meta)
-    raise ValueError(f"unknown format: {fmt} (expected html, md or csv)")
+    if fmt == "json":
+        return render_json(results, meta, scans)
+    raise ValueError(f"unknown format: {fmt} (expected html, md, csv or json)")

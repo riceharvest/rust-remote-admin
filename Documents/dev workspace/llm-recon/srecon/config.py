@@ -47,7 +47,18 @@ SCORE_WEIGHTS = {
     "IMPOSSIBLE_INVENTORY": 40,
     "WEAK_OLLAMA": 15,
     "SUSPICIOUS_INVENTORY": 10,
+    # round-2 honeypot heuristics (all < 40 so no single one flips IMPOSTOR)
+    "MISSING_SERVER_HEADER": 15,
+    "IMPOSSIBLE_LATENCY": 30,
+    "CANNED_BANNER": 20,
+    # informational only: a proxy legitimately aggregates many vendors
+    "PROXY_INVENTORY": 0,
 }
+# Signatures that are known multi-backend proxies / gateways: when one is
+# present, conflicting owned_by vendors on /v1/models are EXPECTED (LiteLLM
+# in front of OpenAI+Anthropic, an OpenRouter-style aggregator, ...) and must
+# NOT flip IMPOSTOR. Frontends (openwebui) count as proxies here too.
+PROXY_SIGS = frozenset({"litellm", "custom-gateway"})
 # signature combinations that are common legitimate stacks, not impostors
 LEGIT_COMBOS = {
     frozenset({"openwebui", "ollama"}),

@@ -8,7 +8,7 @@ import time
 
 from .config import (
     PROBE_TIMEOUT, CONNECT_TIMEOUT, PROBE_PATHS,
-    SCORE_WEIGHTS, LEGIT_COMBOS, FRONTENDS, SIG_PRIORITY,
+    SCORE_WEIGHTS, LEGIT_COMBOS, FRONTENDS, SIG_PRIORITY, PROXY_SIGS,
     REAL_LLAMACPP_MARKERS, PROPRIETARY_VENDORS,
     CLOUD_SUFFIX, VERIFY_TIMEOUT, VERIFY_PROMPT, VERIFY_MAX_TOKENS,
 )
@@ -43,6 +43,7 @@ def classify(host, port, probe_cb=None, timeout=PROBE_TIMEOUT, paths=None):
         "bgp_prefix": None,
         "net_type": None,
         "score": 0,
+        "score_reasons": [],
         "inventory_hash": None,
         "verify_result": None,     # live / auth-walled / honeypot / timeout / error
         "verify_detail": None,
@@ -135,6 +136,71 @@ def _header_evidence(ep):
     return ev
 
 
+# a loose "looks like a version" token: at least one dotted numeric part
+_VERSION_TOKEN_RE = re.compile(r"\d+\.\d+")
+# llama.cpp Server banners use build tags like "llama-cpp-r2285" / "b1234"
+_LLAMACPP_BUILD_RE = re.compile(r"([rb])(\d{3,})", re.I)
+
+
+def _llamacpp_hdr_version(ep):
+    """Version/build from a llama.cpp Server (or x-*) header, if any."""
+    for v in _flatten_id_headers(ep).values():
+        if "llama" not in v.lower():
+            continue
+        m = _VERSION_TOKEN_RE.search(v)
+        if m:
+            return v[m.start():].strip()[:40]
+        b = _LLAMACPP_BUILD_RE.search(v)
+        if b:
+            return ("r" if b.group(1).lower() == "r" else "b") + b.group(2)
+    return None
+
+
+def _is_localhost(target):
+    t = str(target or "").split(":", 1)[0].lower()
+    return t in ("localhost", "::1", "127.0.0.1") or t.startswith("127.")
+
+
+def _flatten_id_headers(ep):
+    """All Server + x-* headers across endpoints, as a flat {key: value} map."""
+    out = {}
+    for e in ep.values():
+        if not isinstance(e, dict):
+            continue
+        for k, v in (e.get("headers") or {}).items():
+            kl = k.lower()
+            if kl == "server" or kl.startswith("x-"):
+                out[kl] = str(v)
+    return out
+
+
+def _version_from_headers(hdrs):
+    """Mine a version-looking token from an identifying-header value, if any."""
+    for v in hdrs.values():
+        m = _VERSION_TOKEN_RE.search(v)
+        if m:
+            return v[m.start():].strip()[:40]
+    return None
+
+
+def _fill_version(ep, sig):
+    """Best-effort version for a signature that lacks one: /version JSON first,
+    then an identifying header. Never overwrites an already-known version."""
+    if sig.get("version"):
+        return sig
+    v = None
+    ve = ep.get("/version") or {}
+    if ve.get("status") == 200 and isinstance(ve.get("json"), dict):
+        cand = ve["json"].get("version")
+        if isinstance(cand, str) and cand.strip() and _VERSION_TOKEN_RE.search(cand):
+            v = cand.strip()[:40]
+    if v is None:
+        v = _version_from_headers(_flatten_id_headers(ep))
+    if v:
+        sig["version"] = v
+    return sig
+
+
 def detect_sigs(ep):
     """Collect product-family signatures from a probed endpoint map."""
 
@@ -182,12 +248,29 @@ def detect_sigs(ep):
             m.get("remote_host") for m in tags["models"][:30]
             if isinstance(m, dict) and m.get("remote_host")
         }
+        # GET-visible model depth: /api/tags entries already carry parameter
+        # size + quantization via their "details" sub-object (/api/show is POST
+        # and intentionally NOT probed here).
+        details = {}
+        for m in tags["models"][:30]:
+            if not isinstance(m, dict) or not m.get("name"):
+                continue
+            det = m.get("details") or {}
+            if isinstance(det, dict) and det.get("parameter_size"):
+                details[str(m["name"])] = {
+                    "parameter_size": str(det.get("parameter_size")),
+                    "quantization": str(det.get("quantization_level"))
+                    if det.get("quantization_level") else None,
+                }
+        first_model = (local_names or all_names)[0] if (local_names or all_names) else None
         sigs["ollama"] = {
             "models": all_names,
+            "model": first_model,
             "cloud_models": cloud_names,
             "local_models": local_names,
             "remote_hosts": sorted(str(h) for h in remote_hosts),
             "root_banner": root_ok,
+            "model_meta": details,
         }
     ov = j("/api/version")
     if "ollama" in sigs and isinstance(ov, dict) and ov.get("version"):
@@ -195,25 +278,44 @@ def detect_sigs(ep):
 
     mi = j("/get_model_info")
     if isinstance(mi, dict) and ("model_path" in mi or "tokenizer_path" in mi):
-        sigs["sglang"] = {"model": mi.get("model_path")}
+        m = mi.get("model_path")
+        sig = {"model": m}
+        if m:
+            sig["models"] = [m]
+        sigs["sglang"] = sig
     elif "sglang" in hdr:
         sigs["sglang"] = {"evidence": "; ".join(hdr["sglang"])}
     si = j("/get_server_info")
-    if "sglang" in sigs and isinstance(si, dict) and si.get("version"):
-        sigs["sglang"]["version"] = str(si["version"])
+    if "sglang" in sigs:
+        if isinstance(si, dict) and si.get("version"):
+            sigs["sglang"]["version"] = str(si["version"])
+        elif not sigs["sglang"].get("version"):
+            # SGLang also exposes /version with a vLLM-style "version" field
+            _fill_version(ep, sigs["sglang"])
 
     props = j("/props")
     if isinstance(props, dict) and (
         "model" in props or "model_path" in props or "default_generation_settings" in props
     ):
         real = any(k in props for k in REAL_LLAMACPP_MARKERS)
-        sigs["llamacpp"] = {
-            "model": props.get("model_path") or props.get("model"),
-            "real_markers": real,
-        }
+        dgs = props.get("default_generation_settings")
+        dgs = dgs if isinstance(dgs, dict) else {}
+        model = (props.get("model_alias")
+                 or props.get("model_path")
+                 or dgs.get("model")
+                 or props.get("model"))
+        sig = {"model": model, "real_markers": real}
+        if model:
+            sig["models"] = [model]
         bi = props.get("build_info")
         if bi:
-            sigs["llamacpp"]["version"] = str(bi)[:40]
+            sig["version"] = str(bi)[:40]
+        else:
+            # llama.cpp server banners "Server: llama-cpp-rXXXX" — mine the build
+            v = _llamacpp_hdr_version(ep)
+            if v:
+                sig["version"] = v
+        sigs["llamacpp"] = sig
 
     lms = j("/api/v0/models")
     if isinstance(lms, dict) and isinstance(lms.get("data"), list):
@@ -370,6 +472,11 @@ def detect_sigs(ep):
         else:
             sigs["openai-compat"] = {"models": v1_ids}
 
+    # Best-effort version surface: any signature that still lacks one can
+    # take /version JSON (or an identifying header) so analyze() reliably
+    # populates result['version']. Explicit per-framework versions win.
+    for _s in sigs.values():
+        _fill_version(ep, _s)
     return sigs
 
 
@@ -574,6 +681,11 @@ def analyze(dossier):
     v1_ids = []
     _e = ep.get("/v1/models") or {}
     models = _e.get("json") if _e.get("status") == 200 else None
+    # A multi-backend proxy / UI frontend legitimately aggregates unrelated
+    # proprietary vendors (LiteLLM in front of OpenAI+Anthropic, an
+    # OpenRouter-style aggregator, Open WebUI multiplexing). When one is
+    # present, conflicting ownership is EXPECTED, not imposture.
+    proxy_present = any(s in PROXY_SIGS or s in FRONTENDS for s in sigs)
     if isinstance(models, dict) and isinstance(models.get("data"), list):
         owners = set()
         for m in models["data"]:
@@ -585,28 +697,92 @@ def analyze(dossier):
             dossier["model"] = v1_ids[0]
         proprietary = owners & PROPRIETARY_VENDORS
         if len(proprietary) >= 2:
-            dossier["verdict"] = "IMPOSTOR"
-            flags.append(
-                "IMPOSSIBLE_INVENTORY: claims proprietary vendors "
-                f"{sorted(proprietary)} on one box"
-            )
+            if proxy_present:
+                flags.append(
+                    "PROXY_INVENTORY: multiple proprietary vendors "
+                    f"{sorted(proprietary)} via a proxy/frontend (expected)"
+                )
+            else:
+                dossier["verdict"] = "IMPOSTOR"
+                flags.append(
+                    "IMPOSSIBLE_INVENTORY: claims proprietary vendors "
+                    f"{sorted(proprietary)} on one box"
+                )
         elif proprietary and len(sigs) >= 1:
             flags.append(f"SUSPICIOUS_INVENTORY: claims {sorted(proprietary)} ownership")
 
+    # --- round-2 honeypot heuristics ---
+    # (a) MISSING_SERVER_HEADER: a bare /v1/models openai-compat surface that
+    # answers 200 but sends NO identifying header (no Server, no x-*) and has
+    # no /version to pin a framework is a headless replay/canary tell.
+    if "openai-compat" in sigs and v1_ids:
+        id_hdrs = _flatten_id_headers(ep)
+        ve = ep.get("/version") or {}
+        ve_json = ve.get("json") if isinstance(ve.get("json"), dict) else {}
+        ver_pin = isinstance(ve_json.get("version"), str) and ve_json.get("version")
+        if not id_hdrs and not ver_pin:
+            flags.append(
+                "MISSING_SERVER_HEADER: /v1/models answered but no Server "
+                "or x-* header and no /version to pin a real framework"
+            )
+    # (b) IMPOSSIBLE_LATENCY: a model-listing endpoint answered in <5ms from a
+    # non-localhost target is a replay/canary tell (no real stack is that fast).
+    if (dossier.get("latency_ms") is not None
+            and dossier["latency_ms"] < 5
+            and not _is_localhost(dossier.get("target"))):
+        flags.append(
+            f"IMPOSSIBLE_LATENCY: {dossier['latency_ms']}ms for a model-listing "
+            "endpoint from a remote target (replay/canary tell)"
+        )
+    # (c) CANNED_BANNER: root returns a framework marketing HTML <title> but
+    # every probed API path 404s with an identical tiny body.
+    root = ep.get("/") or {}
+    if root.get("status") == 200 and "<title" in str(root.get("raw", "")).lower():
+        api_404 = []
+        for _p, _e in ep.items():
+            if _p == "/" or not isinstance(_e, dict):
+                continue
+            if _e.get("status") == 404 and isinstance(_e.get("raw"), str):
+                api_404.append(_e["raw"])
+        if api_404 and len(api_404) > 2 \
+                and len(set(api_404)) == 1 and len(api_404[0]) < 200:
+            flags.append(
+                "CANNED_BANNER: root shows a marketing HTML title but all "
+                f"{len(api_404)} API paths 404 with identical tiny bodies"
+            )
+
     # --- suspicion score ---
     score = 0
+    scored = []
     for f in flags:
-        score += SCORE_WEIGHTS.get(f.split(":", 1)[0], 0)
+        w = SCORE_WEIGHTS.get(f.split(":", 1)[0], 0)
+        if w:
+            score += w
+            scored.append(f.split(":", 1)[0])
     dossier["score"] = min(100, score)  # cap/normalize at 100
+    dossier["score_reasons"] = scored
     if score >= 40:
         dossier["verdict"] = "IMPOSTOR"
 
     # --- inventory fingerprint (fleet clustering) ---
-    inv_ids = sorted(str(i) for i in v1_ids)
-    inv_names = sorted(str(n) for n in sigs.get("ollama", {}).get("models", []))
-    if inv_ids or inv_names:
+    # Broadened: product + version + the full sorted model surface, so the same
+    # model list on different frameworks (or different versions) does NOT
+    # collapse into one fleet. Stable/deterministic across runs.
+    sigtag = list(v1_ids)
+    for _s in sigs.values():
+        sigtag.extend(_s.get("models") or [])
+        if _s.get("model"):
+            sigtag.append(_s["model"])
+    sigtag.extend(sigs.get("ollama", {}).get("models", []))
+    sigtag = [str(m) for m in sigtag if str(m)]
+    if sigtag:
+        inv_parts = [
+            str(dossier.get("product") or ""),
+            str(dossier.get("version") or ""),
+            "|".join(sorted(set(sigtag))),
+        ]
         dossier["inventory_hash"] = hashlib.sha256(
-            ("|".join(inv_ids) + "#" + "|".join(inv_names)).encode()
+            "\u001f".join(inv_parts).encode()
         ).hexdigest()[:16]
 
     return dossier
