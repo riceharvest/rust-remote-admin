@@ -15,8 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from srecon import probe
 
 
-def ep(status, js=None, raw=""):
-    return {"status": status, "json": js, "raw": raw}
+def ep(status, js=None, raw="", headers=None):
+    return {"status": status, "json": js, "raw": raw,
+            "headers": headers or {}}
 
 
 def make_dossier(endpoints):
@@ -63,6 +64,76 @@ class AnalyzeVerdictsTest(unittest.TestCase):
         self.assertEqual(out["score"], 0)
         self.assertIsNotNone(out["inventory_hash"])
         self.assertRegex(out["inventory_hash"], r"^[0-9a-f]{16}$")
+
+    def test_openai_compat_envelope_alone_is_not_vllm(self):
+        # bare OpenAI envelope with no vLLM-specific marker: generic family,
+        # NOT proof of vLLM (LiteLLM/LocalAI/MLC/proxies all serve this)
+        d = make_dossier({
+            "/v1/models": ep(200, {"object": "list", "data": [
+                {"id": "gpt-4o-mini", "owned_by": "openai"}]}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "openai-compat")
+        self.assertNotIn("vllm", out["product"])
+        self.assertEqual(out["verdict"], "GENUINE")
+        self.assertEqual(out["models_served"], ["gpt-4o-mini"])
+        self.assertIsNotNone(out["inventory_hash"])
+
+    def test_fake_litellm_not_vllm(self):
+        # LiteLLM answers the envelope + /health/liveliness LIVE: the
+        # specific backend wins and vllm must NOT be claimed
+        d = make_dossier({
+            "/health/liveliness": ep(200, None, "LIVE"),
+            "/models": ep(200, ["gpt-4o-mini", "claude-3-haiku"]),
+            "/version": ep(200, {"version": "v0.6.6"}),  # vllm-like version!
+            "/v1/models": ep(200, {"object": "list", "data": [
+                {"id": "gpt-4o-mini"}]}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "litellm")
+        self.assertNotIn("vllm", out["product"])
+        self.assertEqual(out["verdict"], "GENUINE")
+        self.assertEqual(out["models_served"], ["gpt-4o-mini", "claude-3-haiku"])
+
+    def test_custom_gateway_when_version_carries_model_field(self):
+        # hand-copied endpoints: /version has a "model" field no stock
+        # framework sets -> custom-gateway, not vllm, not openai-compat
+        d = make_dossier({
+            "/version": ep(200, {"model": "my-gateway-model",
+                                 "version": "1.2.3"}),
+            "/v1/models": ep(200, {"object": "list", "data": [
+                {"id": "my-gateway-model"}]}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "custom-gateway")
+        self.assertEqual(out["model"], "my-gateway-model")
+        self.assertEqual(out["verdict"], "GENUINE")
+
+    def test_vllm_via_x_vllm_header(self):
+        d = make_dossier({
+            "/v1/models": ep(200, {"data": [{"id": "Qwen2.5-7B"}]},
+                             headers={"x-vllm": "0.6.6"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "vllm")
+        self.assertEqual(out["verdict"], "GENUINE")
+
+    def test_vllm_via_server_banner(self):
+        d = make_dossier({
+            "/v1/models": ep(200, {"data": [{"id": "Qwen2.5-7B"}]},
+                             headers={"server": "vllm/0.6.6"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "vllm")
+
+    def test_mlc_via_x_mlc_llm_header(self):
+        d = make_dossier({
+            "/v1/models": ep(200, {"data": [{"id": "Llama-3-8B"}]},
+                             headers={"x-mlc-llm": "1"}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["product"], "mlc")
+        self.assertEqual(out["verdict"], "GENUINE")
 
     def test_ollama_genuine_with_root_banner(self):
         d = make_dossier({
@@ -147,6 +218,31 @@ class AnalyzeVerdictsTest(unittest.TestCase):
         self.assertEqual(out["product"], "ollama+openwebui")
         self.assertNotIn("MULTI_PERSONA", flag_names(out))
 
+    def test_legit_openwebui_tgi_stack_is_genuine(self):
+        # frontend + exactly one backend is a legit stack, not multi-persona
+        d = make_dossier({
+            "/info": ep(200, {"model_id": "meta-llama/Llama-3.1-8B"}),
+            "/api/version": ep(200, {"version": "0.5.8"}),
+            "/api/config": ep(200, {"status": True}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["verdict"], "GENUINE")
+        self.assertEqual(out["product"], "tgi+openwebui")  # priority order
+        self.assertNotIn("MULTI_PERSONA", flag_names(out))
+
+    def test_legit_openwebui_plus_generic_backend_is_genuine(self):
+        # openwebui in front of an unidentified OpenAI-compatible backend
+        d = make_dossier({
+            "/v1/models": ep(200, {"object": "list", "data": [
+                {"id": "gpt-4o-mini"}]}),
+            "/api/version": ep(200, {"version": "0.5.8"}),
+            "/api/config": ep(200, {"status": True}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["verdict"], "GENUINE")
+        self.assertEqual(out["product"], "openai-compat+openwebui")
+        self.assertNotIn("MULTI_PERSONA", flag_names(out))
+
     def test_fake_llamacpp_impostor(self):
         # /props present but missing real llama-server markers
         d = make_dossier({
@@ -182,6 +278,22 @@ class AnalyzeVerdictsTest(unittest.TestCase):
         self.assertIn("SUSPICIOUS_INVENTORY", flag_names(out))
         self.assertEqual(out["score"], 10)
 
+    def test_score_capped_at_100(self):
+        # FAKE_LLAMACPP(40) + MULTI_PERSONA(35) + WEAK_OLLAMA(15) +
+        # IMPOSSIBLE_INVENTORY(40) = 130 -> must cap at 100
+        d = make_dossier({
+            "/": ep(200, None, "<html>other app</html>"),
+            "/api/tags": ep(200, {"models": [{"name": "llama3"}]}),
+            "/props": ep(200, {"model_path": "/m/models.gguf"}),
+            "/v1/models": ep(200, {"data": [
+                {"id": "gpt-4", "owned_by": "openai"},
+                {"id": "claude-3", "owned_by": "anthropic"},
+            ]}),
+        })
+        out = probe.analyze(d)
+        self.assertEqual(out["score"], 100)
+        self.assertEqual(out["verdict"], "IMPOSTOR")
+
 
 class DetectSigsMatrixTest(unittest.TestCase):
     """Every framework registered in config must be fingerprintable here."""
@@ -204,12 +316,34 @@ class DetectSigsMatrixTest(unittest.TestCase):
             {"id": "llama-3.2-3b"}]})}, "lmstudio"),
         "koboldcpp": ({"/api/extra/version": ep(
             200, {"result": "KoboldCpp v1.79", "version": "1.79"})}, "koboldcpp"),
-        "tgwui": ({"/v1/internal/model/info": ep(
-            200, {"model_name": "llama3"})}, "tgwui"),
+        "tgwui": ({"/api/v1/model": ep(200, {"model": "llama3"})}, "tgwui"),
         "tgi": ({"/info": ep(200, {"model_id": "meta-llama/Llama-3.1-8B",
                                    "version": "2.4.0"})}, "tgi"),
         "openwebui": ({"/api/version": ep(200, {"version": "0.5.8"}),
                        "/api/config": ep(200, {"status": True})}, "openwebui"),
+        "aphrodite": ({"/version": ep(200, {"app_name": "Aphrodite-Engine",
+                                            "version": "0.6.6"}),
+                       "/v1/models": ep(200, {"data": [
+                           {"id": "mistral-7b"}]})}, "aphrodite"),
+        "triton": ({"/v2/health/ready": ep(200, None, "ready"),
+                    "/v2/models": ep(200, {"models": [
+                        {"name": "llama-3-8b"}]})}, "triton"),
+        "localai": ({"/readyz": ep(200, None, "READY"),
+                     "/v1/models": ep(200, {"data": [
+                         {"id": "gpt-4"}]})}, "localai"),
+        "xinference": ({"/api/models": ep(200, [{"model_uid": "llama3"}]),
+                        "/v1/models": ep(200, {"data": [
+                            {"id": "llama3", "owned_by": "xinference"}]})},
+                       "xinference"),
+        "litellm": ({"/health/liveliness": ep(200, None, "LIVE"),
+                     "/models": ep(200, ["gpt-4o-mini"])}, "litellm"),
+        "tabbyapi": ({"/v1/model_template": ep(
+            200, {"data": {"id": "tabby-8b"}}),
+            "/v1/profile": ep(200, {"data": {"id": "tabby"}})}, "tabbyapi"),
+        "mlc": ({"/v1/models": ep(200, {"data": [{"id": "Llama-3-8B"}]},
+                                  headers={"x-mlc-llm": "1"})}, "mlc"),
+        "openai-compat": ({"/v1/models": ep(200, {"object": "list", "data": [
+            {"id": "gpt-4o-mini"}]})}, "openai-compat"),
     }
 
     def test_every_framework_produces_its_signature(self):
@@ -220,7 +354,8 @@ class DetectSigsMatrixTest(unittest.TestCase):
 
     def test_ollama_suppresses_vllm_signature(self):
         # ollama serves /version + the OpenAI /v1/models envelope too, so a
-        # single ollama process must NOT be reported as vLLM co-hosted
+        # single ollama process must NOT be reported as vLLM co-hosted (nor
+        # as a generic openai-compat backend)
         endpoints = {
             "/version": ep(200, {"version": "0.5.7"}),
             "/v1/models": ep(200, {"object": "list", "data": [
@@ -231,6 +366,22 @@ class DetectSigsMatrixTest(unittest.TestCase):
         sigs = probe.detect_sigs(endpoints)
         self.assertIn("ollama", sigs)
         self.assertNotIn("vllm", sigs)
+        self.assertNotIn("openai-compat", sigs)
+
+    def test_tgi_internal_model_info_credited_to_tgi(self):
+        # /v1/internal/model/info is a TGI marker, not text-generation-webui
+        sigs = probe.detect_sigs({
+            "/v1/internal/model/info": ep(200, {"model_name": "llama3"}),
+        })
+        self.assertIn("tgi", sigs)
+        self.assertNotIn("tgwui", sigs)
+
+    def test_tgwui_via_gradio_run_predict(self):
+        # Gradio apps answer GET /run/predict with 405 (POST-only endpoint)
+        sigs = probe.detect_sigs({
+            "/run/predict": ep(405, None, "Method Not Allowed"),
+        })
+        self.assertIn("tgwui", sigs)
 
 
 class VerifyInferenceTest(unittest.TestCase):
@@ -263,43 +414,51 @@ class VerifyInferenceTest(unittest.TestCase):
         def close(self):
             pass
 
-    def _run(self, responses):
+    def _run(self, responses, sigs=None):
         self.FakeHTTPConnection.responses = responses
         self.FakeHTTPConnection.instances = []
+        # default to the ollama schema when sigs not supplied
+        sigs = sigs if sigs is not None else {"ollama"}
         with mock.patch("srecon.probe.http.client.HTTPConnection",
                         self.FakeHTTPConnection):
-            return probe.verify_inference("1.2.3.4", 11434)
+            return probe.verify_inference("1.2.3.4", 11434, sigs=sigs)
 
-    def test_live_generation(self):
+    def _posts(self):
+        return [i.last for i in self.FakeHTTPConnection.instances
+                if i.last and i.last[0] == "POST"]
+
+    def test_live_generation_ollama(self):
         verdict, detail = self._run([
             self.FakeResponse(200, {"models": [{"name": "llama3.2:1b"}]}),
             self.FakeResponse(200, {"done": True, "response": "Hello!",
                                     "model": "llama3.2:1b"}),
-        ])
+        ], sigs={"ollama"})
         self.assertEqual(verdict, "live")
         self.assertIn("Hello!", detail)
+        posts = self._posts()
+        self.assertEqual(posts[0][1], "/api/generate")
 
-    def test_honeypot_canned_empty_response(self):
+    def test_honeypot_canned_empty_response_ollama(self):
         verdict, detail = self._run([
             self.FakeResponse(200, {"models": [{"name": "llama3.2:1b"}]}),
             self.FakeResponse(200, {"done": True, "response": "",
                                     "model": "llama3.2:1b"}),
-        ])
+        ], sigs={"ollama"})
         self.assertEqual(verdict, "honeypot")
-        self.assertIn("done=true, empty response", detail)
+        self.assertIn("canned empty ollama response", detail)
 
     def test_auth_walled_401(self):
         verdict, detail = self._run([
             self.FakeResponse(200, {"models": [{"name": "m:cloud"}]}),
             self.FakeResponse(401, {"error": "unauthorized: sign in required"}),
-        ])
+        ], sigs={"ollama"})
         self.assertEqual(verdict, "auth-walled")
         self.assertIn("unauthorized", detail.lower())
 
     def test_no_models_advertised(self):
         verdict, detail = self._run([
             self.FakeResponse(200, {"models": []}),
-        ])
+        ], sigs={"ollama"})
         self.assertEqual(verdict, "error")
         self.assertEqual(detail, "no models advertised")
 
@@ -309,11 +468,65 @@ class VerifyInferenceTest(unittest.TestCase):
                 {"name": "very-long-name:cloud"}, {"name": "aa"}]}),
             self.FakeResponse(200, {"done": True, "response": "ok",
                                     "model": "aa"}),
-        ])
-        posts = [i.last for i in self.FakeHTTPConnection.instances
-                 if i.last and i.last[0] == "POST"]
+        ], sigs={"ollama"})
+        posts = self._posts()
         self.assertEqual(len(posts), 1)
         self.assertIn('"model": "aa"', posts[0][2])
+
+    def test_openai_compat_verify_dispatches_to_v1_completions(self):
+        verdict, detail = self._run([
+            self.FakeResponse(200, {"object": "list", "data": [
+                {"id": "gpt-4o-mini"}, {"id": "x"}]}),
+            self.FakeResponse(200, {"choices": [{"text": "Hi there"}]}),
+        ], sigs={"openai-compat"})
+        self.assertEqual(verdict, "live")
+        posts = self._posts()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][1], "/v1/completions")
+        self.assertIn('"model": "x"', posts[0][2])  # shortest id wins
+        self.assertIn('"max_tokens"', posts[0][2])
+
+    def test_vllm_verify_uses_openai_schema(self):
+        self._run([
+            self.FakeResponse(200, {"data": [{"id": "Qwen2.5-7B"}]}),
+            self.FakeResponse(200, {"choices": [{"text": "ok"}]}),
+        ], sigs={"vllm"})
+        posts = self._posts()
+        self.assertEqual(posts[0][1], "/v1/completions")
+
+    def test_llamacpp_verify_dispatches_to_completion(self):
+        verdict, detail = self._run([
+            self.FakeResponse(200, {"data": [{"id": "llama-3.2-3b"}]}),
+            self.FakeResponse(200, {"content": "Hi!"}),
+        ], sigs={"llamacpp"})
+        self.assertEqual(verdict, "live")
+        posts = self._posts()
+        self.assertEqual(posts[0][1], "/completion")
+        self.assertIn('"n_predict"', posts[0][2])
+
+    def test_tgi_verify_dispatches_to_generate(self):
+        verdict, detail = self._run([
+            self.FakeResponse(200, {"model_id": "meta-llama/Llama-3.1-8B"}),
+            self.FakeResponse(200, {"generated_text": "Hi"}),
+        ], sigs={"tgi"})
+        self.assertEqual(verdict, "live")
+        posts = self._posts()
+        self.assertEqual(posts[0][1], "/generate")
+        self.assertIn('"max_new_tokens"', posts[0][2])
+
+    def test_openai_honeypot_canned_empty_choices(self):
+        verdict, detail = self._run([
+            self.FakeResponse(200, {"data": [{"id": "gpt-4o-mini"}]}),
+            self.FakeResponse(200, {"choices": [{"text": ""}]}),
+        ], sigs={"openai-compat"})
+        self.assertEqual(verdict, "honeypot")
+        self.assertIn("canned empty openai response", detail)
+
+    def test_unknown_product_skipped(self):
+        verdict, detail = self._run([], sigs={})
+        self.assertEqual(verdict, "skipped")
+        self.assertEqual(detail, "no verify schema for product unknown")
+        self.assertEqual(self.FakeHTTPConnection.instances, [])
 
 
 if __name__ == "__main__":

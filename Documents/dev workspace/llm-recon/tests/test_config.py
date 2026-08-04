@@ -20,9 +20,16 @@ DETECTOR_PATHS = {
     "ollama": "/api/tags",
     "lmstudio": "/api/v0/models",
     "koboldcpp": "/api/extra/version",
-    "tgwui": "/v1/internal/model/info",
+    "tgwui": "/api/v1/model",
     "tgi": "/info",
     "openwebui": "/api/config",
+    "aphrodite": "/version",
+    "triton": "/v2/health/ready",
+    "localai": "/readyz",
+    "xinference": "/api/models",
+    "litellm": "/health/liveliness",
+    "tabbyapi": "/v1/model_template",
+    "mlc": "/v1/models",
 }
 
 
@@ -77,11 +84,12 @@ class FrameworkRegistryTest(unittest.TestCase):
     def test_cross_framework_port_collisions_are_known(self):
         # narrowing to one framework is safe as long as its own list is
         # unique; cross-framework overlap is expected and documented.
-        # Currently only port 3000 is shared (tgi + openwebui).
+        # Currently shared: 3000 (tgi+openwebui), 5000 (tgwui+tabbyapi),
+        # 8000 (vllm+triton), 8080 (llamacpp+localai+mlc).
         from collections import Counter
         counts = Counter(p for fw in config.FRAMEWORKS.values() for p in fw["ports"])
         shared = {p for p, n in counts.items() if n > 1}
-        self.assertEqual(shared, {3000},
+        self.assertEqual(shared, {3000, 5000, 8000, 8080},
                          f"unexpected cross-framework port collision: {shared}")
 
     def test_no_framework_port_list_is_empty_or_falsy(self):
@@ -108,6 +116,31 @@ class ScoringConfigTest(unittest.TestCase):
     def test_proprietary_vendors_are_lowercase_names(self):
         for v in config.PROPRIETARY_VENDORS:
             self.assertEqual(v, v.lower(), v)
+
+    def test_frontends_reference_real_frameworks(self):
+        for name in config.FRONTENDS:
+            self.assertIn(name, config.FRAMEWORKS, name)
+
+    def test_sig_priority_covers_all_frameworks_and_generics(self):
+        expected = set(config.FRAMEWORKS) | {"openai-compat", "custom-gateway"}
+        self.assertEqual(set(config.SIG_PRIORITY), expected)
+        self.assertEqual(len(config.SIG_PRIORITY), len(set(config.SIG_PRIORITY)))
+
+    def test_generic_gateway_sigs_rank_below_specific_backends(self):
+        # priority selection must prefer concrete backends over the generic
+        # openai-compat/custom-gateway labels (frontends are lowest)
+        for generic in ("openai-compat", "custom-gateway"):
+            for fw in config.FRAMEWORKS:
+                if fw in config.FRONTENDS:  # frontends rank lowest, by design
+                    continue
+                # a specific backend must rank (earlier index) above a generic
+                self.assertLess(
+                    config.SIG_PRIORITY.index(fw),
+                    config.SIG_PRIORITY.index(generic),
+                    f"{fw} must rank above {generic}")
+
+    def test_lean_ports_subset_of_default_ports(self):
+        self.assertTrue(config.LEAN_PORTS <= set(config.DEFAULT_PORTS))
 
 
 if __name__ == "__main__":

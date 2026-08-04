@@ -34,7 +34,8 @@ class DbTestCase(unittest.TestCase):
         try:
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            return {r[0] for r in rows}
+            # sqlite_sequence is internal bookkeeping for AUTOINCREMENT
+            return {r[0] for r in rows if r[0] != "sqlite_sequence"}
         finally:
             conn.close()
 
@@ -43,19 +44,48 @@ class SchemaTest(DbTestCase):
     def test_init_db_creates_schema(self):
         conn = db._init_db()
         conn.close()
-        self.assertEqual(self._tables(), {"targets", "honeypot_fleets"})
+        self.assertEqual(self._tables(),
+                         {"targets", "honeypot_fleets", "scans"})
         conn = sqlite3.connect(db.STATE_DB)
         try:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(targets)")}
         finally:
             conn.close()
         self.assertTrue({"ip", "port", "verdict", "product", "score",
-                         "scanned_at", "fp"} <= cols)
+                         "scanned_at", "fp", "scan_id"} <= cols)
 
     def test_init_db_is_idempotent(self):
         db._init_db().close()
         db._init_db().close()  # must not raise
-        self.assertEqual(self._tables(), {"targets", "honeypot_fleets"})
+        self.assertEqual(self._tables(),
+                         {"targets", "honeypot_fleets", "scans"})
+
+    def test_migration_bumps_user_version_to_latest(self):
+        db._init_db().close()  # fresh temp DB migrates straight to latest
+        self.assertEqual(db.schema_version(), db._SCHEMA_VERSION)
+        db._init_db().close()
+        self.assertEqual(db.schema_version(), db._SCHEMA_VERSION)
+
+    def test_targets_table_has_persisted_drop_fields(self):
+        db._init_db().close()
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(targets)")}
+        finally:
+            conn.close()
+        expected = {"model", "models_served", "version", "verify_result",
+                    "verify_detail", "latency_ms", "asn", "as_name",
+                    "bgp_prefix", "net_type", "error", "scan_id"}
+        self.assertTrue(expected <= cols)
+
+    def test_wal_journal_mode_on_connect(self):
+        db._init_db().close()
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(mode, "wal")
 
 
 class DedupCacheTest(DbTestCase):
@@ -103,6 +133,112 @@ class DedupCacheTest(DbTestCase):
         self.assertEqual(db.recent_targets(ttl_days=30), {("2.3.4.5", 11434)})
 
 
+class DropFieldPersistenceTest(DbTestCase):
+    def test_store_scan_result_round_trips_persisted_fields(self):
+        db.store_scan_result({
+            "target": "1.2.3.4:11434", "verdict": "GENUINE",
+            "product": "ollama", "score": 12,
+            "model": "llama3.1:8b", "models_served": ["a", "b"],
+            "version": "0.3.10", "verify_result": "PASS",
+            "verify_detail": "first token ok", "latency_ms": 42.5,
+            "asn": "AS1234", "as_name": "Example", "bgp_prefix": "1.2.3.0/24",
+            "net_type": "datacenter",
+        })
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            row = conn.execute(
+                "SELECT model, models_served, version, verify_result, "
+                "verify_detail, latency_ms, asn, as_name, bgp_prefix, net_type "
+                "FROM targets WHERE ip='1.2.3.4'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        model, models_served, version, verify_result, verify_detail, \
+            latency_ms, asn, as_name, bgp_prefix, net_type = row
+        self.assertEqual(model, "llama3.1:8b")
+        self.assertEqual(json.loads(models_served), ["a", "b"])
+        self.assertEqual(version, "0.3.10")
+        self.assertEqual(verify_result, "PASS")
+        self.assertEqual(verify_detail, "first token ok")
+        self.assertEqual(latency_ms, 42.5)
+        self.assertEqual(asn, "AS1234")
+        self.assertEqual(as_name, "Example")
+        self.assertEqual(bgp_prefix, "1.2.3.0/24")
+        self.assertEqual(net_type, "datacenter")
+
+    def test_store_scan_result_without_enrichment_keeps_nulls(self):
+        db.store_scan_result({"target": "1.2.3.4:8080", "verdict": "DARK"})
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            row = conn.execute(
+                "SELECT model, asn, error, scan_id FROM targets "
+                "WHERE ip='1.2.3.4'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (None, None, None, None))
+
+    def test_store_results_persists_scan_id_and_fields(self):
+        sid = db.start_scan(target_count=1, params={"fast": True})
+        db.store_results([
+            {"target": "1.2.3.4:8000", "verdict": "GENUINE",
+             "product": "vllm", "model": "qwen2.5:7b"},
+        ], scan_id=sid)
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            row = conn.execute(
+                "SELECT scan_id, model FROM targets WHERE ip='1.2.3.4'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (sid, "qwen2.5:7b"))
+
+
+class ScanHistoryTest(DbTestCase):
+    def test_start_and_query_scan(self):
+        sid = db.start_scan(target_count=10, params={"fleet": "llamacpp"})
+        self.assertIsInstance(sid, int)
+        scan = db.get_scan(sid)
+        self.assertEqual(scan["scan_id"], sid)
+        self.assertEqual(scan["target_count"], 10)
+        self.assertIsNotNone(scan["started_at"])
+        self.assertIsNone(scan["finished_at"])
+        self.assertIn("llamacpp", scan["params_json"])
+
+    def test_finish_scan_records_stats(self):
+        sid = db.start_scan()
+        db.finish_scan(sid, stats={"total": 3, "genuine": 2})
+        scan = db.get_scan(sid)
+        self.assertIsNotNone(scan["finished_at"])
+        self.assertEqual(json.loads(scan["stats_json"]),
+                         {"total": 3, "genuine": 2})
+
+    def test_list_scans_newest_first(self):
+        a = db.start_scan()
+        b = db.start_scan()
+        scans = db.list_scans()
+        ids = [s["scan_id"] for s in scans]
+        self.assertIn(a, ids)
+        self.assertIn(b, ids)
+        self.assertEqual(ids, sorted(ids, reverse=True))
+
+    def test_get_scan_missing_returns_none(self):
+        self.assertIsNone(db.get_scan(999999))
+
+    def test_store_scan_result_associates_scan_id(self):
+        sid = db.start_scan()
+        db.store_scan_result(
+            {"target": "1.2.3.4:8080", "verdict": "UNKNOWN"}, scan_id=sid)
+        db.store_scan_result({"target": "5.6.7.8:8080", "verdict": "DARK"})
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            linked = conn.execute(
+                "SELECT COUNT(*) FROM targets WHERE scan_id=?", (sid,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(linked, 1)
+
+
 class BlocklistTest(DbTestCase):
     def test_add_and_load_blocklist(self):
         self.assertEqual(db.load_blocklist(), set())
@@ -110,6 +246,31 @@ class BlocklistTest(DbTestCase):
         db.add_blocklist("5.6.7.8")
         db.add_blocklist("1.2.3.4")  # duplicate append tolerated, set dedupes
         self.assertEqual(db.load_blocklist(), {"1.2.3.4", "5.6.7.8"})
+
+    def test_add_blocklist_strips_port(self):
+        db.add_blocklist("9.9.9.9:11434")
+        self.assertEqual(db.load_blocklist(), {"9.9.9.9"})
+        # file itself stores bare IP
+        with open(db.BLOCKLIST_FILE) as f:
+            content = set(f.read().splitlines())
+        self.assertEqual(content, {"9.9.9.9"})
+
+    def test_load_blocklist_normalizes_host_port_in_memory(self):
+        # pre-existing mixed-format file
+        with open(db.BLOCKLIST_FILE, "w") as f:
+            f.write("# comment\n1.2.3.4\n5.6.7.8:8080\n\n")
+        self.assertEqual(db.load_blocklist(), {"1.2.3.4", "5.6.7.8"})
+        # load does NOT rewrite the file
+        with open(db.BLOCKLIST_FILE) as f:
+            self.assertIn("5.6.7.8:8080", f.read())
+
+    def test_normalize_blocklist_rewrites_bare_ips(self):
+        with open(db.BLOCKLIST_FILE, "w") as f:
+            f.write("# comment\n1.2.3.4\n5.6.7.8:8080\n9.9.9.9\n5.6.7.8\n")
+        ips = db.normalize_blocklist()
+        self.assertEqual(ips, {"1.2.3.4", "5.6.7.8", "9.9.9.9"})
+        with open(db.BLOCKLIST_FILE) as f:
+            self.assertEqual(f.read().strip(), "1.2.3.4\n5.6.7.8\n9.9.9.9")
 
 
 class HoneypotFleetTest(DbTestCase):
@@ -135,10 +296,28 @@ class HoneypotFleetTest(DbTestCase):
         self.assertEqual(row[0], 3)
         self.assertEqual(json.loads(row[1]), {"IMPOSTOR": 3})
 
+    def test_list_honeypots_returns_learned_fleets(self):
+        self.assertEqual(db.list_honeypots(), [])
+        db.learn_honeypots(self._results(3))
+        fleets = db.list_honeypots()
+        self.assertEqual(len(fleets), 1)
+        self.assertEqual(fleets[0]["inv_hash"], "abc123")
+        self.assertEqual(fleets[0]["member_count"], 3)
+        self.assertEqual(fleets[0]["verdicts"], {"IMPOSTOR": 3})
+        self.assertIsNotNone(fleets[0]["first_seen"])
+        self.assertIsNotNone(fleets[0]["last_seen"])
+
     def test_fleet_requires_three_members(self):
         learned = db.learn_honeypots(self._results(2))
         self.assertEqual(learned, 0)
         self.assertEqual(db.load_blocklist(), set())
+
+    def test_learn_honeypots_tolerates_host_port_in_file(self):
+        # seed a mixed-format line; learn_honeypots must still load bare IPs
+        with open(db.BLOCKLIST_FILE, "w") as f:
+            f.write("8.8.8.8:53\n")
+        db.learn_honeypots(self._results(3))
+        self.assertEqual(db.load_blocklist(), {"1.2.3.4", "8.8.8.8"})
 
     def test_majority_impostor_threshold(self):
         # 2 of 3 impostor (0.66 >= 0.6) still blocks the fleet
