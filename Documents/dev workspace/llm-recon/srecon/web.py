@@ -905,16 +905,37 @@ function renderDossiers() {
     for (const d of pageItems) tb.appendChild(rowFor(d));
   }
 }
+function verifyBadgeHtml(d) {
+  const vr = d.verify_result;
+  if (!vr) return '';
+  const cls = {
+    'live': 'verify-live',
+    'auth-walled': 'verify-auth-walled',
+    'honeypot': 'verify-honeypot',
+    'timeout': 'verify-timeout',
+    'error': 'verify-error',
+    'skipped': 'verify-skipped',
+    'none': 'verify-none',
+  }[vr] || 'verify-none';
+  const label = vr.charAt(0).toUpperCase() + vr.slice(1).replace('-', ' ');
+  return `<span class="verify-badge ${cls}" title="${esc(label)}">${esc(label)}</span>`;
+}
+function scoreTooltipHtml(d) {
+  const reasons = d.score_reasons;
+  if (!reasons || !reasons.length) return '';
+  const txt = reasons.join('\n');
+  return `<div class="score-tooltip">${esc(txt)}</div>`;
+}
 function rowFor(d) {
   const tr = document.createElement('tr');
   tr.className = 'd-row';
   tr.innerHTML = `<td>${esc(d.target)}</td><td>${esc(d.product)}</td>` +
-    `<td><span class="stamp ${d.verdict}">${d.verdict}</span></td>` +
+    `<td><span class="stamp ${d.verdict}">${d.verdict}</span>${verifyBadgeHtml(d)}</td>` +
     `<td>${esc(d.version || '\\u2014')}</td><td>${invHtml(d)}</td>` +
         `<td>${esc(d.ptr || '\\u2014')}</td>` +
         `<td>${asnHtml(d)}</td>` +
-    `<td style="color:${d.score >= 40 ? 'var(--red)' : d.score > 0 ? 'var(--amber)' : '#555'}">${d.score || 0}</td>` +
-    `<td>${flagHtml(d) || '\u2014'}</td><td>${d.latency_ms ?? '\u2014'}</td>`;
+    `<td class="score-cell" style="color:${d.score >= 40 ? 'var(--red)' : d.score > 0 ? 'var(--amber)' : '#555'}">${d.score || 0}${scoreTooltipHtml(d)}</td>` +
+    `<td>${flagHtml(d) || '\\u2014'}</td><td>${d.latency_ms ?? '\\u2014'}</td>`;
   tr.onclick = () => toggleDetail(tr, d);
   return tr;
 }
@@ -1089,6 +1110,179 @@ function drawLatency() {
 }
 function drawCharts() { drawSpark(); drawDonut(); drawPorts(); drawLatency(); }
 
+// ---------- trend chart ----------
+async function refreshTrendChart() {
+  try {
+    const r = await fetch('/api/scan-trend');
+    const d = await r.json();
+    const trend = d.trend || [];
+    const chartEl = $('trend-chart');
+    const legendEl = $('trend-legend');
+    if (!trend.length) {
+      chartEl.style.display = 'none';
+      legendEl.style.display = 'none';
+      return;
+    }
+    chartEl.style.display = 'block';
+    legendEl.style.display = 'flex';
+
+    const colors = {
+      GENUINE: '#33ff66',
+      IMPOSTOR: '#ff3333',
+      UNKNOWN: '#ffb000',
+      DARK: '#555555',
+      ERROR: '#bb88ee',
+    };
+    const labels = {GENUINE: 'GENUINE', IMPOSTOR: 'IMPOSTOR', UNKNOWN: 'UNKNOWN', DARK: 'DARK', ERROR: 'ERROR'};
+
+    const n = trend.length;
+    const barW = Math.max(2, Math.floor(chartEl.clientWidth / n) - 2);
+    const groupGap = 2;
+    const totalGroupW = (barW * 5) + (groupGap * 4);
+    const startX = Math.max(0, (chartEl.clientWidth - totalGroupW * n) / 2);
+    const bottom = 20;
+    const top = 10;
+    const h = chartEl.clientHeight - bottom - top;
+    const maxVal = Math.max(1, ...trend.flatMap(t => [t.genuine, t.impostor, t.unknown, t.dark, t.error]));
+
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${chartEl.clientWidth}" height="${chartEl.clientHeight}" style="width:100%;height:100%;display:block">`;
+
+    for (let i = 0; i < n; i++) {
+      const t = trend[i];
+      const vals = [
+        {k: 'GENUINE', v: t.genuine},
+        {k: 'IMPOSTOR', v: t.impostor},
+        {k: 'UNKNOWN', v: t.unknown},
+        {k: 'DARK', v: t.dark},
+        {k: 'ERROR', v: t.error},
+      ];
+      const baseX = startX + i * totalGroupW;
+      vals.forEach((item, j) => {
+        if (item.v <= 0) return;
+        const x = baseX + j * (barW + groupGap);
+        const barH = Math.max(1, (item.v / maxVal) * h);
+        const y = chartEl.clientHeight - bottom - barH;
+        const tooltip = `${labels[item.k]}: ${item.v}`;
+        svg += `<rect class="trend-bar" x="${x}" y="${y}" width="${barW}" height="${barH}" fill="${colors[item.k]}" data-scan="${t.scan_id}" title="${esc(tooltip)}"/>`;
+      });
+      // scan label
+      const cx = baseX + (totalGroupW / 2);
+      svg += `<text x="${cx}" y="${chartEl.clientHeight - 4}" text-anchor="middle" font-size="8" fill="#555">${esc(t.finished_str.slice(5, 16))}</text>`;
+    }
+    svg += '</svg>';
+    chartEl.innerHTML = svg;
+
+    // click handler on bars
+    chartEl.querySelectorAll('.trend-bar').forEach(bar => {
+      bar.onclick = () => {
+        const sid = bar.dataset.scan;
+        $('hist').value = sid;
+        $('hist-load').click();
+      };
+    });
+
+    // legend
+    const cats = ['GENUINE', 'IMPOSTOR', 'UNKNOWN', 'DARK', 'ERROR'];
+    legendEl.innerHTML = cats.map(k =>
+      `<span><span class="swatch" style="background:${colors[k]}"></span>${labels[k]}</span>`
+    ).join('');
+  } catch (e) {
+    console.error('trend chart refresh failed:', e);
+  }
+}
+
+// ---------- compare view ----------
+async function refreshCompareSelects() {
+  try {
+    const r = await fetch('/api/history');
+    const d = await r.json();
+    const scans = d.scans || [];
+    const opts = scans.map(s =>
+      `<option value="${esc(s.id)}">${esc(s.when)} — ${s.total} dossiers (${s.impostor} impostor, ${s.genuine} genuine)</option>`
+    ).join('');
+    $('diff-a').innerHTML = '<option value="">-- select scan A --</option>' + opts;
+    $('diff-b').innerHTML = '<option value="">-- select scan B --</option>' + opts;
+  } catch (e) {
+    console.error('compare select refresh failed:', e);
+  }
+}
+async function showDiffModal(a, b) {
+  const title = $('diff-modal-title');
+  const body = $('diff-modal-body');
+  const overlay = $('diff-modal-overlay');
+  const modal = $('diff-modal');
+  title.textContent = `SCAN DIFF: ${a} → ${b}`;
+  body.innerHTML = '<div style="text-align:center;color:var(--phos-dim)">loading diff...</div>';
+  overlay.classList.add('open');
+  modal.classList.add('open');
+  try {
+    const r = await fetch(`/api/diff?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+    const d = await r.json();
+    if (d.error) {
+      body.innerHTML = `<div style="color:var(--red)">${esc(d.error)}</div>`;
+      return;
+    }
+    const sections = [
+      {key: 'new', label: 'NEW', color: 'var(--phos)'},
+      {key: 'gone', label: 'GONE', color: 'var(--red)'},
+      {key: 'changed', label: 'CHANGED', color: 'var(--amber)'},
+    ];
+    body.innerHTML = sections.map(sec => {
+      const arr = d[sec.key] || [];
+      if (!arr.length) {
+        return `<div class="diff-section">
+          <h4 style="color:${sec.color}">${sec.label} <span class="diff-count">(${d.summary[sec.key] || 0})</span></h4>
+          <div class="diff-list"><div class="diff-item" style="color:#555;font-style:italic">none</div></div>
+        </div>`;
+      }
+      if (sec.key === 'changed') {
+        return `<div class="diff-section">
+          <h4 style="color:${sec.color}">${sec.label} <span class="diff-count">(${d.summary.changed || 0})</span></h4>
+          <div class="diff-list">${arr.map(item => {
+            const ch = item.changes || {};
+            const changeLines = Object.entries(ch).map(([field, vals]) => {
+              if (field === 'models' && vals === 'unknown') {
+                return `<div class="change"><span class="unknown">models: unknown (legacy row)</span></div>`;
+              }
+              if (Array.isArray(vals)) {
+                return `<div class="change">${esc(field)}: <span class="from">${esc(String(vals[0]))}</span> → <span class="to">${esc(String(vals[1]))}</span></div>`;
+              }
+              return '';
+            }).join('');
+            return `<div class="diff-item"><div class="target">${esc(item.target)}</div>${changeLines}</div>`;
+          }).join('')}</div>
+        </div>`;
+      }
+      return `<div class="diff-section">
+        <h4 style="color:${sec.color}">${sec.label} <span class="diff-count">(${d.summary[sec.key] || 0})</span></h4>
+        <div class="diff-list">${arr.map(item =>
+          `<div class="diff-item"><div class="target">${esc(item.target)}</div>` +
+          (item.product ? `<div class="muted">${esc(item.product)}${item.version ? ' ' + esc(item.version) : ''}</div>` : '') +
+          (item.verdict ? `<span class="stamp ${item.verdict}" style="font-size:9px;margin-top:2px">${item.verdict}</span>` : '') +
+          `</div>`
+        ).join('')}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--red)">${esc(String(e))}</div>`;
+  }
+}
+$('diff-go').onclick = async () => {
+  const a = $('diff-a').value;
+  const b = $('diff-b').value;
+  if (!a || !b) { log('DIFF: select both scans.', 'warn'); return; }
+  if (a === b) { log('DIFF: scans must be different.', 'warn'); return; }
+  await showDiffModal(a, b);
+};
+$('diff-modal-close').onclick = () => {
+  $('diff-modal-overlay').classList.remove('open');
+  $('diff-modal').classList.remove('open');
+};
+$('diff-modal-overlay').onclick = () => {
+  $('diff-modal-overlay').classList.remove('open');
+  $('diff-modal').classList.remove('open');
+};
+
 function tick() {
   const el = (Date.now() - S.t0) / 1000;
   const eta = S.done ? Math.round(el / S.done * (S.total - S.done)) : 0;
@@ -1222,6 +1416,8 @@ $('go').onclick = async () => {
       }
     }
     refreshProductSelect(); renderDossiers(); drawCharts(); updateIntel();
+    refreshTrendChart();
+    refreshCompareSelects();
     $('export').style.display = 'inline-block';
     $('exportcsv').style.display = 'inline-block';
     $('retarget').style.display = 'inline-block';
@@ -1309,12 +1505,16 @@ $('hist-load').onclick = async () => {
   S.byTarget = {};
   for (const r of S.results) S.byTarget[r.target] = r;
   updateProgress(); updateStats(); refreshProductSelect(); renderDossiers(); drawCharts(); updateIntel();
+  refreshTrendChart();
+  refreshCompareSelects();
   $('export').style.display = 'inline-block';
   $('exportcsv').style.display = 'inline-block';
   $('retarget').style.display = 'inline-block';
   log(`archive loaded: ${S.results.length} dossier(s) from ${id}.`);
 };
 refreshHistory();
+refreshTrendChart();
+refreshCompareSelects();
 </script>
 </body>
 </html>
