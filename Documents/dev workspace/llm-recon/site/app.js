@@ -19,7 +19,8 @@
     trend:      'data/trend.json',
     frameworks: 'data/frameworks.json',
     asns:       'data/asns.json',
-    geo:        'data/geo.json'
+    geo:        'data/geo.json',
+    shodan:     'data/shodan_census.json'
   };
 
   var PLACEHOLDER_MSG = 'no data yet — run srecon publish';
@@ -388,19 +389,60 @@
 
   /* ------------------------------------------------------------------- boot */
 
+  function renderShodan(data) {
+    var panel = $('shodan-panel');
+    if (!panel) return;
+    if (!data || !data.counts || !Object.keys(data.counts).length) {
+      panel.textContent = '';
+      panel.appendChild(el('p', 'placeholder',
+        'no shodan totals — run python3 -m srecon.census'));
+      return;
+    }
+    panel.textContent = '';
+    var table = el('table', 'census');
+    var thead = el('thead');
+    var hr = el('tr');
+    ['FRAMEWORK', 'INDEX TOTAL', 'NOTE'].forEach(function (h) {
+      hr.appendChild(el('th', null, h));
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = el('tbody');
+    var entries = Object.keys(data.counts).map(function (k) {
+      return [k, data.counts[k]];
+    }).sort(function (a, b) { return (b[1] || 0) - (a[1] || 0); });
+    entries.forEach(function (e) {
+      var r = el('tr');
+      r.appendChild(el('td', null, e[0]));
+      r.appendChild(el('td', null, fmt(e[1])));
+      r.appendChild(el('td', 'dim', e[1] === null || e[1] === undefined
+        ? 'query failed' : 'index-wide'));
+      tbody.appendChild(r);
+    });
+    table.appendChild(tbody);
+    panel.appendChild(table);
+    if (data.generated_at) {
+      panel.appendChild(el('p', 'dim footnote',
+        'fetched from Shodan host/count at ' + fmtStamp(data.generated_at, true) +
+        ' — totals only, no raw hosts'));
+    }
+  }
+
   function boot() {
     renderSummary(null);          /* initial dim state; refined when data lands */
     renderTrend(null);
     renderFrameworks(null);
     renderAsns(null);
     renderGeo(null);
+    renderShodan(null);
 
     Promise.all([
       load('summary').then(function (d) { if (d) renderSummary(d); }),
       load('trend').then(function (d) { if (d) renderTrend(d); }),
       load('frameworks').then(function (d) { if (d) renderFrameworks(d); }),
       load('asns').then(function (d) { if (d) renderAsns(d); }),
-      load('geo').then(function (d) { if (d) renderGeo(d); })
+      load('geo').then(function (d) { if (d) renderGeo(d); }),
+      load('shodan').then(function (d) { if (d) renderShodan(d); })
     ]);
   }
 
