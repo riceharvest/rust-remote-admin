@@ -33,7 +33,10 @@ Config file shape (JSON)::
     }
 
 ``deliver(alerts, config)`` dispatches to whichever channels are configured
-and returns per-channel ``{ok, error}``.
+and returns per-channel ``{ok, error}``. When ``config`` has ``"digest": true``
+it routes to ``deliver_digest(alerts, config)``, which folds the whole batch
+into one compact message per channel (headline ``'N alerts across M targets'``
+and a webhook ``digest`` summary object ``{count, high_count, targets}``).
 """
 
 import json
@@ -80,8 +83,46 @@ def _summary(alerts):
     return base
 
 
-def _payload(alerts, kind, generated_at):
-    """Shape the webhook body for the requested channel kind."""
+def _digest_targets(alerts):
+    """Unique alert targets, sorted (for the digest summary)."""
+    return sorted({a.get("target") for a in alerts if a.get("target")})
+
+
+def _digest_headline(alerts):
+    """Digest subject/headline, e.g. '3 alerts across 2 targets'."""
+    return "%d alerts across %d targets" % (len(alerts),
+                                            len(_digest_targets(alerts)))
+
+
+def _digest_summary(alerts):
+    """Machine-readable digest summary object for webhook payloads."""
+    high = sum(1 for a in alerts
+               if str(a.get("severity") or "").lower() == "high")
+    return {"count": len(alerts), "high_count": high,
+            "targets": _digest_targets(alerts)}
+
+
+def build_digest_subject(alerts):
+    """Subject for a digest message (one message for the whole batch)."""
+    return _digest_headline(alerts)
+
+
+def build_digest_body(alerts):
+    """Compact digest body: headline line + one line per alert."""
+    lines = [_digest_headline(alerts)]
+    lines.extend(_line(a) for a in alerts)
+    return "\n".join(lines)
+
+
+def _payload(alerts, kind, generated_at, digest=False):
+    """Shape the webhook body for the requested channel kind.
+
+    ``digest=True`` folds every alert into a single compact message: the
+    headline becomes the message text/title and (for ``generic``) a
+    ``digest`` summary object ``{count, high_count, targets}`` is added.
+    """
+    if digest:
+        return _payload_digest(alerts, kind, generated_at)
     if kind == "slack":
         return {
             "text": _summary(alerts),
@@ -112,6 +153,40 @@ def _payload(alerts, kind, generated_at):
     return {"alerts": alerts, "generated_at": generated_at, "count": len(alerts)}
 
 
+def _payload_digest(alerts, kind, generated_at):
+    """Digest webhook payload: one compact message for the whole batch."""
+    headline = _digest_headline(alerts)
+    if kind == "slack":
+        return {
+            "text": headline,
+            "attachments": [
+                {
+                    "color": _SLACK_COLORS.get(a.get("severity"), "#95A5A6"),
+                    "title": "[%s] %s %s" % (
+                        str(a.get("severity") or "?").upper(),
+                        a.get("kind"), a.get("target")),
+                    "text": _describe(a),
+                }
+                for a in alerts
+            ],
+        }
+    if kind == "discord":
+        return {
+            "embeds": [
+                {
+                    "title": headline,
+                    "color": (_DISCORD_COLORS.get(alerts[0].get("severity"))
+                              if alerts else 0x95A5A6),
+                    "description": "\n".join(_line(a) for a in alerts)
+                                   or "no alerts",
+                }
+            ],
+        }
+    # generic: raw machine payload + digest summary object
+    return {"alerts": alerts, "generated_at": generated_at, "count": len(alerts),
+            "digest": _digest_summary(alerts)}
+
+
 def _kind_from_url(url, default):
     """Read ?kind=slack|discord|generic from the URL, else ``default``."""
     try:
@@ -128,16 +203,18 @@ def _kind_from_url(url, default):
 # webhook adapter
 # ---------------------------------------------------------------------------
 
-def notify_webhook(url, alerts, kind="generic", timeout=10):
+def notify_webhook(url, alerts, kind="generic", timeout=10, digest=False):
     """POST an alert payload to a webhook URL. Never raises.
 
-    Returns ``{"ok": bool, "error": str|None}``. Any URL/connection/HTTP
-    error is caught and reported in ``error``.
+    ``digest=True`` folds the whole batch into a single compact message (see
+    ``_payload_digest``). Returns ``{"ok": bool, "error": str|None}``. Any
+    URL/connection/HTTP error is caught and reported in ``error``.
     """
     try:
         resolved = _kind_from_url(url, kind)
         generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        data = json.dumps(_payload(alerts, resolved, generated_at)).encode("utf-8")
+        data = json.dumps(_payload(alerts, resolved, generated_at,
+                                   digest=digest)).encode("utf-8")
         req = urllib.request.Request(
             url, data=data, method="POST",
             headers={"Content-Type": "application/json"})
@@ -228,7 +305,13 @@ def deliver(alerts, config):
     ``config`` is a dict: ``{"webhook": url, "smtp": {...}}``. Each present
     channel is attempted; the result is ``{channel: {"ok": bool, "error": ...}}``
     for the channels that exist in the config. Never raises.
+
+    When ``config["digest"]`` is truthy the whole batch is folded into a
+    single compact message per channel (``deliver_digest``) instead of one
+    message per alert.
     """
+    if isinstance(config, dict) and config.get("digest"):
+        return deliver_digest(alerts, config)
     results = {}
     if not isinstance(config, dict):
         return results
@@ -251,6 +334,48 @@ def deliver(alerts, config):
             subject = smtp_cfg.get("subject") or build_email_subject(alerts)
             results["email"] = notify_email(
                 host, from_addr, to_addrs, subject, build_email_body(alerts),
+                user=smtp_cfg.get("user"), password=smtp_cfg.get("password"),
+                port=smtp_cfg.get("port"), use_tls=smtp_cfg.get("use_tls", True))
+    return results
+
+
+def deliver_digest(alerts, config):
+    """Deliver ``alerts`` as one compact digest message per channel.
+
+    Same channel handling as ``deliver()`` (webhook + SMTP), but instead of
+    per-alert messages the whole batch is folded into a single message:
+
+    * webhook — one payload with all alerts plus a ``digest`` summary object
+      ``{count, high_count, targets}`` (generic kind; slack/discord get the
+      ``'N alerts across M targets'`` headline as text/title);
+    * email — one message whose subject and body headline read
+      ``'N alerts across M targets'`` with one compact line per alert.
+
+    Result shape and never-raises guarantee match ``deliver()``.
+    """
+    results = {}
+    if not isinstance(config, dict):
+        return results
+
+    webhook_url = config.get("webhook")
+    if webhook_url:
+        results["webhook"] = notify_webhook(webhook_url, alerts, digest=True)
+
+    smtp_cfg = config.get("smtp")
+    if smtp_cfg:
+        host = smtp_cfg.get("host")
+        from_addr = smtp_cfg.get("from")
+        to_addrs = smtp_cfg.get("to")
+        if not host or not from_addr or not to_addrs:
+            results["email"] = {
+                "ok": False,
+                "error": "smtp config requires host, from and to",
+            }
+        else:
+            subject = (smtp_cfg.get("subject")
+                       or build_digest_subject(alerts))
+            results["email"] = notify_email(
+                host, from_addr, to_addrs, subject, build_digest_body(alerts),
                 user=smtp_cfg.get("user"), password=smtp_cfg.get("password"),
                 port=smtp_cfg.get("port"), use_tls=smtp_cfg.get("use_tls", True))
     return results

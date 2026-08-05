@@ -8,7 +8,7 @@ Usage:
     python3 -m srecon report --scan-id 5 --format json --scans
     python3 -m srecon scans [--last 10] [--json]
     python3 -m srecon diff 1 2 [--json]
-    python3 -m srecon alerts [--baseline N] [--current N] [--watch new,flip,model,tls,verify] [--min-severity high|medium|low] [--json] [--no-state] [--state PATH] [--notify] [--notify-config PATH]
+    python3 -m srecon alerts [--baseline N] [--current N] [--watch new,flip,model,tls,verify] [--min-severity high|medium|low] [--cooldown-hours N] [--json] [--no-state] [--state PATH] [--notify] [--notify-config PATH] [--digest]
     python3 -m srecon import shodan.jsonl [--format shodan] [--scan-id 6] [--dry-run]
     python3 -m srecon prefixes --asn 24940
     python3 -m srecon cidrs --cc DE
@@ -21,6 +21,7 @@ Usage:
 All output is machine-parseable JSON/NDJSON by default.
 """
 import argparse
+import io
 import json
 import os
 import sys
@@ -234,6 +235,7 @@ def cmd_alerts(args):
             state_path=args.state,
             use_state=not args.no_state,
             min_severity=args.min_severity,
+            cooldown_hours=args.cooldown_hours,
         )
     except (FileNotFoundError, ValueError) as e:
         _eprint(f"error: {e}")
@@ -247,6 +249,8 @@ def cmd_alerts(args):
         print(render_alerts_human(alerts))
     if args.notify and notify_cfg is not None:
         from .notify import deliver
+        if args.digest:
+            notify_cfg["digest"] = True  # force digest mode
         results = deliver(alerts, notify_cfg)
         if not results:
             _eprint("notify: no channels configured in notify config")
@@ -279,6 +283,57 @@ def cmd_import(args):
     else:
         print(f"imported={counts['imported']} skipped={counts['skipped']} "
               f"errors={counts['errors']}")
+
+
+def cmd_export(args):
+    """Export filtered raw targets from the history DB (offline).
+
+    Prints NDJSON to stdout by default; ``--format txt`` prints ``host:port``
+    lines ready to feed back into ``--targets-file``. Exit code is always 0
+    (an empty export prints nothing).
+    """
+    from .export import (export_targets, write_csv, write_jsonl, write_txt,
+                         _txt_lines)
+
+    try:
+        rows = export_targets(
+            db_path=args.db, verdict=args.verdict, product=args.product,
+            scan_id=args.scan_id, min_score=args.min_score,
+            tls_only=args.tls_only, live_only=args.live_only,
+            limit=args.limit, fields=args.fields,
+        )
+    except Exception as e:  # noqa: BLE001 - CLI always prints a verdict
+        _eprint(f"error: export failed: {e}")
+        sys.exit(1)
+
+    if not rows:
+        return  # exit 0, print nothing
+
+    fmt = args.format
+    if args.output:
+        try:
+            if fmt == "jsonl":
+                write_jsonl(rows, args.output)
+            elif fmt == "csv":
+                write_csv(rows, args.output)
+            else:
+                write_txt(rows, args.output)
+            _eprint(f"[export] {len(rows)} row(s) written to {args.output}")
+        except OSError as e:
+            _eprint(f"error: cannot write output: {e}")
+            sys.exit(1)
+        return
+
+    if fmt == "jsonl":
+        for r in rows:
+            print(json.dumps(r, default=str))
+    elif fmt == "csv":
+        buf = io.StringIO()
+        write_csv(rows, buf)
+        sys.stdout.write(buf.getvalue())
+    else:  # txt: host:port lines, retargetable via --targets-file
+        for line in _txt_lines(rows):
+            print(line)
 
 
 def _resolve_target_lines(args):
@@ -802,6 +857,12 @@ def main():
     p_alert.add_argument("--notify-config", default=None, metavar="PATH",
                          help="Notify config JSON path "
                               "(default: srecon/data/notify.json)")
+    p_alert.add_argument("--cooldown-hours", type=int, default=0, metavar="N",
+                         help="Suppress re-emission of the same (target, kind) "
+                              "alert within N hours (default: 0 = disabled)")
+    p_alert.add_argument("--digest", action="store_true",
+                         help="When --notify, deliver one compact digest "
+                              "message per channel instead of one per alert")
     p_alert.add_argument("--db", default=None, metavar="PATH",
                          help="History DB path (default: srecon/data/state.db)")
     p_alert.set_defaults(func=cmd_alerts)
@@ -817,6 +878,37 @@ def main():
     p_imp.add_argument("--dry-run", action="store_true",
                        help="Parse + map only; do not touch the database")
     p_imp.set_defaults(func=cmd_import)
+
+    # --- export ---
+    p_exp = sub.add_parser(
+        "export",
+        help="Export filtered raw targets from the history DB (offline)")
+    p_exp.add_argument("--verdict", default=None, metavar="LIST",
+                       help="Comma-separated verdicts, e.g. GENUINE,IMPOSTOR")
+    p_exp.add_argument("--product", default=None, metavar="LIST",
+                       help="Comma-separated products, e.g. vllm,ollama")
+    p_exp.add_argument("--scan-id", type=int, metavar="N", default=None,
+                       help="Only export rows from this scan")
+    p_exp.add_argument("--min-score", type=int, metavar="N", default=None,
+                       help="Only export rows with score >= N")
+    p_exp.add_argument("--tls-only", action="store_true",
+                       help="Only export rows served over TLS")
+    p_exp.add_argument("--live-only", action="store_true",
+                       help="Drop DARK / ERROR rows")
+    p_exp.add_argument("--limit", type=int, metavar="N", default=None,
+                       help="Cap the number of exported rows")
+    p_exp.add_argument("--fields", default=None, metavar="LIST",
+                       help="Comma-separated field list or '*' for all "
+                            "(default: target,ip,port,verdict,product,score,"
+                            "scanned_at,flags,model,version,verify_result,"
+                            "asn,as_name,tls_enabled)")
+    p_exp.add_argument("--format", choices=["jsonl", "csv", "txt"], default="jsonl",
+                       help="Output format (default: jsonl)")
+    p_exp.add_argument("--output", "-o", default=None, metavar="PATH",
+                       help="Write to PATH (default: stdout)")
+    p_exp.add_argument("--db", default=None, metavar="PATH",
+                       help="History DB path (default: srecon/data/state.db)")
+    p_exp.set_defaults(func=cmd_export)
 
     # --- publish ---
     p_pub = sub.add_parser(

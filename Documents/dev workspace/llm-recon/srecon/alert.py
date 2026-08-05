@@ -18,8 +18,11 @@ Severity: ``high`` for VERDICT_FLIP->IMPOSTOR, TLS_DROP and VERIFY_REGRESSION;
 state is ``medium``).
 
 The CLI (``python3 -m srecon alerts``) drives this module. State: a small JSON
-file records the last ``scan_id_b`` processed so repeated runs do not re-emit;
-pass ``--no-state`` (``use_state=False``) to ignore it.
+file records the last ``scan_id_b`` processed so repeated runs do not re-emit
+(e.g. ``{"last_scan_id_b": 7}``); pass ``--no-state`` (``use_state=False``) to
+ignore it. With ``cooldown_hours`` set, the state file additionally keeps a
+``cooldowns`` map (``{"target|kind": epoch}``) that throttles re-emission of
+the same ``(target, kind)`` pair within the window.
 
 Schema note: the ``targets`` table keys on ``(ip, port)`` with INSERT OR REPLACE,
 so a single live DB retains only the newest row per endpoint. This generator is
@@ -33,6 +36,7 @@ is exactly the shape a caller needs to diff two historical snapshots.
 import json
 import os
 import sqlite3
+import time
 
 from .config import STATE_DB
 
@@ -295,21 +299,63 @@ def default_state_path(db_path=None):
 
 
 def _load_state(state_path):
+    """Load the dedup/cooldown state file.
+
+    Returns ``(last_scan_id_b, cooldowns)`` where ``cooldowns`` maps the
+    ``target|kind`` key to the last-emit ``time.time()`` epoch. Backward
+    compatible: a legacy file holding only ``last_scan_id_b`` (or no file at
+    all) yields ``(0, {})``.
+    """
     try:
         with open(state_path) as f:
             data = json.load(f)
-        return int(data.get("last_scan_id_b") or 0)
+        last = int(data.get("last_scan_id_b") or 0)
+        raw_cd = data.get("cooldowns")
+        cooldowns = {}
+        if isinstance(raw_cd, dict):
+            for key, ts in raw_cd.items():
+                try:
+                    cooldowns[str(key)] = float(ts)
+                except (TypeError, ValueError):
+                    continue
+        return last, cooldowns
     except (OSError, ValueError, TypeError):
-        return 0
+        return 0, {}
 
 
-def _save_state(state_path, scan_id_b):
+def _save_state(state_path, scan_id_b, cooldowns=None):
+    """Persist the state file. ``cooldowns`` is optional and preserved when
+    non-empty; ``None``/empty keeps the file in the legacy shape."""
     try:
         os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+        data = {"last_scan_id_b": scan_id_b}
+        if cooldowns:
+            data["cooldowns"] = cooldowns
         with open(state_path, "w") as f:
-            json.dump({"last_scan_id_b": scan_id_b}, f)
+            json.dump(data, f)
     except OSError:
         pass  # state is best-effort
+
+
+def _cooldown_key(target, kind):
+    """Stable per-(target, kind) cooldown key (targets are ``ip:port``, so the
+    ``|`` separator is unambiguous)."""
+    return "%s|%s" % (target, kind)
+
+
+def _cooldown_filter(alerts, cooldowns, cooldown_hours, now):
+    """Drop alerts whose (target, kind) cooldown entry is still within the
+    window (``cooldown_hours * 3600`` seconds of the last emit)."""
+    if not cooldown_hours or cooldown_hours <= 0:
+        return alerts
+    window = float(cooldown_hours) * 3600.0
+    kept = []
+    for a in alerts:
+        last_ts = cooldowns.get(_cooldown_key(a.get("target"), a.get("kind")))
+        if last_ts is not None and (now - last_ts) < window:
+            continue  # re-emitted too soon; suppress
+        kept.append(a)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +398,7 @@ def resolve_scan_pair(db_path=None, baseline_scan_id=None, current_scan_id=None)
 
 def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
                     watch=None, state_path=None, use_state=True,
-                    min_severity=None):
+                    min_severity=None, cooldown_hours=0):
     """Generate security-relevant change alerts between two scans.
 
     Loads the baseline/current scan snapshots from SQLite, emits an alert per
@@ -363,6 +409,14 @@ def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
     ``min_severity`` (optional) keeps only alerts at or above that severity,
     in the order ``high > medium > low``. E.g. ``min_severity="medium"``
     returns high and medium alerts but drops low ones.
+
+    ``cooldown_hours`` (optional, default ``0`` = disabled) throttles
+    re-notification: when > 0, an alert for the same ``(target, kind)`` is
+    suppressed if that pair was last emitted less than ``cooldown_hours`` ago
+    (per the ``cooldowns`` map persisted in the state file). Emitted alerts
+    stamp ``cooldowns[target|kind]`` with the current time. Backward
+    compatible — legacy state files without a ``cooldowns`` key work, and
+    ``cooldown_hours=0`` keeps the previous behaviour.
 
     Returns a list of alert dicts:
         {target, kind, watch, old, new, scan_id_b, severity}
@@ -385,8 +439,11 @@ def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
 
     if state_path is None:
         state_path = default_state_path(db_path)
-    if use_state and _load_state(state_path) >= current:
-        return []
+    cooldowns = {}
+    if use_state:
+        last_scan, cooldowns = _load_state(state_path)
+        if last_scan >= current:
+            return []
 
     rows_a = _load_targets(db_path, baseline)
     rows_b = _load_targets(db_path, current)
@@ -397,8 +454,15 @@ def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
         alerts = [a for a in alerts
                   if _SEVERITY_RANK.get(a.get("severity"), 3) <= threshold]
 
+    if cooldown_hours and cooldown_hours > 0:
+        now = time.time()
+        alerts = _cooldown_filter(alerts, cooldowns, cooldown_hours, now)
+        if use_state:
+            for a in alerts:
+                cooldowns[_cooldown_key(a.get("target"), a.get("kind"))] = now
+
     if use_state:
-        _save_state(state_path, current)
+        _save_state(state_path, current, cooldowns)
     return alerts
 
 

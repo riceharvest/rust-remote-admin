@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -281,6 +282,95 @@ class AlertTestCase(unittest.TestCase):
         self.add_target("10.0.0.10", 8000, b, "GENUINE", "vllm", tls=None)
         alerts = alert.generate_alerts(self.db_path, a, b, use_state=False)
         self.assertIn("TLS_DROP", self.by_kind(alerts))
+
+    # ---- cooldown throttling -------------------------------------------------
+
+    def _seed_same_flip(self, count):
+        """Scans where 10.0.0.1 flips verdict on every scan (same kind)."""
+        ids = []
+        verdicts = ["GENUINE", "IMPOSTOR", "UNKNOWN", "GENUINE"]
+        for i in range(count):
+            sid = self.add_scan(100.0 + i)
+            self.add_target("10.0.0.1", 8000, sid, verdict=verdicts[i],
+                            product="vllm")
+            ids.append(sid)
+        return ids
+
+    def test_cooldown_suppresses_second_run_within_window(self):
+        a, b, c = self._seed_same_flip(3)
+        sp = self.state_path()
+        t0 = 1_000_000.0
+        with mock.patch("srecon.alert.time.time", return_value=t0):
+            first = alert.generate_alerts(self.db_path, a, b, state_path=sp,
+                                          cooldown_hours=24)
+        self.assertEqual(len(first), 1)
+        with open(sp) as f:
+            state = json.load(f)
+        self.assertIn("cooldowns", state)
+        self.assertAlmostEqual(
+            state["cooldowns"]["10.0.0.1:8000|VERDICT_FLIP"], t0)
+        # second run within the window: same (target, kind) flip is suppressed
+        with mock.patch("srecon.alert.time.time", return_value=t0 + 3600):
+            second = alert.generate_alerts(self.db_path, b, c, state_path=sp,
+                                           cooldown_hours=24)
+        self.assertEqual(second, [])
+
+    def test_cooldown_emits_after_expiry(self):
+        a, b, c, d = self._seed_same_flip(4)
+        sp = self.state_path()
+        t0 = 1_000_000.0
+        with mock.patch("srecon.alert.time.time", return_value=t0):
+            self.assertEqual(len(alert.generate_alerts(
+                self.db_path, a, b, state_path=sp, cooldown_hours=24)), 1)
+        # still inside the window -> suppressed for the next pair
+        with mock.patch("srecon.alert.time.time", return_value=t0 + 3600):
+            self.assertEqual(alert.generate_alerts(
+                self.db_path, b, c, state_path=sp, cooldown_hours=24), [])
+        # window expired -> the same (target, kind) flip emits again
+        with mock.patch("srecon.alert.time.time",
+                        return_value=t0 + 25 * 3600):
+            third = alert.generate_alerts(
+                self.db_path, c, d, state_path=sp, cooldown_hours=24)
+        self.assertEqual(len(third), 1)
+        self.assertEqual(third[0]["kind"], "VERDICT_FLIP")
+
+    def test_legacy_state_without_cooldowns_works(self):
+        a, b = self.seed_known_diff()
+        sp = self.state_path()
+        # legacy shape: only last_scan_id_b (no 'cooldowns' key)
+        with open(sp, "w") as f:
+            json.dump({"last_scan_id_b": 0}, f)
+        alerts = alert.generate_alerts(self.db_path, a, b, state_path=sp,
+                                       cooldown_hours=24)
+        self.assertEqual(len(alerts), 5)  # nothing to throttle yet
+        # the state file is upgraded with the emitted (target, kind) stamps
+        with open(sp) as f:
+            state = json.load(f)
+        self.assertEqual(len(state.get("cooldowns", {})), 5)
+        # legacy last_scan_id_b is still honored for scan-level dedup
+        with open(sp, "w") as f:
+            json.dump({"last_scan_id_b": b}, f)
+        self.assertEqual(alert.generate_alerts(self.db_path, a, b,
+                                               state_path=sp,
+                                               cooldown_hours=24), [])
+
+    def test_cooldown_hours_zero_disables(self):
+        a, b, c = self._seed_same_flip(3)
+        sp = self.state_path()
+        t0 = 1_000_000.0
+        with mock.patch("srecon.alert.time.time", return_value=t0):
+            self.assertEqual(len(alert.generate_alerts(
+                self.db_path, a, b, state_path=sp, cooldown_hours=0)), 1)
+        # cooldown_hours=0 (the default) leaves throttling off: the same
+        # (target, kind) re-emits on the next pair
+        with mock.patch("srecon.alert.time.time", return_value=t0 + 3600):
+            second = alert.generate_alerts(self.db_path, b, c, state_path=sp,
+                                           cooldown_hours=0)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["kind"], "VERDICT_FLIP")
+        # no cooldowns persisted when throttling is disabled
+        with open(sp) as f:
+            self.assertNotIn("cooldowns", json.load(f))
 
 
 if __name__ == "__main__":

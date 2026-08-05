@@ -84,6 +84,42 @@ python3 -m http.server 8000
 # open http://127.0.0.1:8000/
 ```
 
+## Monthly writeups
+
+`srecon/writeup.py` renders an offline, long-form monthly census report in the
+same "engraved terminal" aesthetic as this dashboard — cream plate,
+ultramarine accent, Didone serif headlines, monospace data tables, hairline
+rules and cross-hatch accents. It aggregates the month's scans and targets
+(verdict mix, framework shift vs the previous month, honeypot ratio, model
+families, ASN concentration), folds in the month's change alerts and TLS cert
+hygiene, and emits a fully self-contained HTML page (inline CSS, no external
+assets) or a plain Markdown version for email/newsletter.
+
+```bash
+# from the repository root, with a populated history DB
+python3 -m srecon.writeup                      # site/reports/YYYY-MM.html for the current month
+python3 -m srecon.writeup --year 2026 --month 7
+python3 -m srecon.writeup --format md          # Markdown for email/newsletter
+python3 -m srecon.writeup --out /tmp/census.html
+python3 -m srecon.writeup --include-targets    # PRIVATE: also list top live targets (ip:port)
+```
+
+`--include-targets` is off by default — the report is meant to stay
+address-free, mirroring the site's "no raw addresses" guarantee. It is a
+**private** artifact: unlike `site/data/*.json` it is not k-anonymized, so do
+not publish the HTML output as-is on the public site unless you regenerate
+without `--include-targets` and review it.
+
+**Publish idea:** keep monthly archives in `site/reports/YYYY-MM.html` and
+link them from `index.html` as a "previous censuses" list — the site stays a
+flat, static directory (each report is self-contained), and the monthly
+long-form writeups become the narrative companion to the live dashboard. A
+cron line the day after month-end:
+
+```cron
+0 2 1 * *  cd /home/dario/Documents/dev\\ workspace/llm-recon && python3 -m srecon.writeup --year $(date -d 'yesterday' +%Y) --month $(date -d 'yesterday' +%-m)
+```
+
 ## Deploy
 
 Any static host works — it is a flat directory with no build step and no

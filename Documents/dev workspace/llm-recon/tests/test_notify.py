@@ -336,6 +336,108 @@ class DeliverTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# digest mode (deliver_digest + config digest:true routing + CLI --digest)
+# ---------------------------------------------------------------------------
+
+class DigestDeliveryTest(unittest.TestCase):
+    def test_digest_webhook_payload_has_summary_and_all_alerts(self):
+        with WebhookServer() as srv:
+            res = notify.deliver_digest(SAMPLE_ALERTS, {"webhook": srv.url})
+        self.assertTrue(res["webhook"]["ok"], res)
+        self.assertEqual(len(srv.bodies), 1)  # one message for the whole batch
+        payload = json.loads(srv.bodies[0])
+        # all alerts still present, now with a digest summary object
+        self.assertEqual(payload["alerts"], SAMPLE_ALERTS)
+        self.assertEqual(payload["count"], 3)
+        self.assertEqual(payload["digest"], {
+            "count": 3,
+            "high_count": 1,
+            "targets": ["10.0.0.1:8000", "10.0.0.2:8000", "10.0.0.3:8000"],
+        })
+
+    def test_digest_email_subject_and_body(self):
+        with mock.patch("srecon.notify.smtplib.SMTP") as fake_cls:
+            res = notify.deliver_digest(SAMPLE_ALERTS, {
+                "smtp": {"host": "smtp.example.com", "from": "a@b.c",
+                         "to": ["d@e.f"]}})
+        self.assertTrue(res["email"]["ok"], res)
+        instance = fake_cls.return_value
+        msg = instance.send_message.call_args.args[0]
+        self.assertEqual(msg["Subject"], "3 alerts across 3 targets")
+        body = msg.get_content()
+        self.assertIn("3 alerts across 3 targets", body)
+        # headline line + one compact line per alert
+        self.assertEqual(len(body.splitlines()), 1 + len(SAMPLE_ALERTS))
+        self.assertIn(
+            "[HIGH] VERDICT_FLIP 10.0.0.1:8000: GENUINE -> IMPOSTOR", body)
+        self.assertIn("[MEDIUM] NEW 10.0.0.3:8000: appeared as GENUINE vllm",
+                      body)
+        self.assertIn("[LOW] MODEL_CHANGE 10.0.0.2:8000: a -> a, b", body)
+
+    def test_digest_email_single_message_not_per_alert(self):
+        with mock.patch("srecon.notify.smtplib.SMTP") as fake_cls:
+            notify.deliver_digest(SAMPLE_ALERTS, {
+                "smtp": {"host": "smtp.example.com", "from": "a@b.c",
+                         "to": ["d@e.f"]}})
+        # exactly one send for the whole batch, not one per alert
+        fake_cls.return_value.send_message.assert_called_once()
+
+    def test_config_digest_true_routes_to_digest(self):
+        with WebhookServer() as srv:
+            res = notify.deliver(SAMPLE_ALERTS,
+                                 {"webhook": srv.url, "digest": True})
+        self.assertTrue(res["webhook"]["ok"], res)
+        payload = json.loads(srv.bodies[0])
+        self.assertIn("digest", payload)
+        self.assertEqual(payload["digest"]["count"], 3)
+
+    def test_config_without_digest_keeps_per_alert_payload(self):
+        with WebhookServer() as srv:
+            res = notify.deliver(SAMPLE_ALERTS,
+                                 {"webhook": srv.url, "digest": False})
+        self.assertTrue(res["webhook"]["ok"], res)
+        payload = json.loads(srv.bodies[0])
+        self.assertEqual(set(payload), {"alerts", "generated_at", "count"})
+
+    def test_digest_webhook_slack_headline(self):
+        with WebhookServer() as srv:
+            res = notify.deliver_digest(SAMPLE_ALERTS,
+                                        {"webhook": srv.url + "?kind=slack"})
+        self.assertTrue(res["webhook"]["ok"], res)
+        payload = json.loads(srv.bodies[0])
+        self.assertEqual(payload["text"], "3 alerts across 3 targets")
+        self.assertEqual(len(payload["attachments"]), 3)
+
+
+class CliDigestFlagTest(unittest.TestCase):
+    def test_digest_flag_parses_at_cli(self):
+        # --digest must parse; with a missing notify config the CLI still
+        # exits 2 with the config error (proving argparse accepted the flag)
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "nope.json")
+            db = os.path.join(tmp, "state.db")
+            proc = subprocess.run(
+                [sys.executable, "-m", "srecon", "alerts", "--digest",
+                 "--notify", "--notify-config", missing, "--db", db],
+                cwd=repo, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(f"no notify config at {missing}", proc.stderr)
+
+    def test_cooldown_hours_flag_parses_at_cli(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "nope.json")
+            db = os.path.join(tmp, "state.db")
+            proc = subprocess.run(
+                [sys.executable, "-m", "srecon", "alerts", "--cooldown-hours",
+                 "24", "--notify", "--notify-config", missing, "--db", db],
+                cwd=repo, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(f"no notify config at {missing}", proc.stderr)
+
+
+# ---------------------------------------------------------------------------
 # min-severity filter (generate_alerts) + CLI missing-config exit path
 # ---------------------------------------------------------------------------
 
