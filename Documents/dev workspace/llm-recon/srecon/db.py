@@ -18,7 +18,7 @@ from .config import DATA_DIR, STATE_DB, BLOCKLIST_FILE
 # no-op. Existing DBs are migrated in place: new columns are added with
 # ALTER TABLE ADD COLUMN, so pre-existing rows simply get NULL.
 # ---------------------------------------------------------------------------
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 # Dropped/enriched result fields persisted onto the targets table. Order is
 # the write order used by the store functions.
@@ -85,10 +85,20 @@ def _migration_3_flags(conn):
         conn.execute("ALTER TABLE targets ADD COLUMN flags TEXT")
 
 
+def _migration_4_tls(conn):
+    """Persist the engine's TLS probe dict onto the targets table
+    (JSON-object TEXT column: {enabled, fingerprint_sha256, issuer, subject,
+    not_after, self_signed})."""
+    cols = _columns(conn, "targets")
+    if "tls" not in cols:
+        conn.execute("ALTER TABLE targets ADD COLUMN tls TEXT")
+
+
 _MIGRATIONS = [
     _migration_1_base_schema,
     _migration_2_scans_and_fields,
     _migration_3_flags,
+    _migration_4_tls,
 ]
 
 
@@ -146,6 +156,15 @@ def _flags_json(d):
     return None
 
 
+def _tls_json(d):
+    """Serialize a result's tls dict (engine TLS probe info) to a JSON
+    string (missing/None -> NULL)."""
+    tls = d.get("tls")
+    if isinstance(tls, dict):
+        return json.dumps(tls)
+    return None
+
+
 def store_results(results, scan_id=None):
     try:
         conn = _init_db()
@@ -158,15 +177,15 @@ def store_results(results, scan_id=None):
                 "INSERT OR REPLACE INTO targets "
                 "(ip,port,verdict,product,score,scanned_at,scan_id,"
                 "model,models_served,version,verify_result,verify_detail,"
-                "latency_ms,asn,as_name,bgp_prefix,net_type,error,flags) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "latency_ms,asn,as_name,bgp_prefix,net_type,error,flags,tls) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (parts[0], int(parts[1]), r.get("verdict", "DARK"),
                  r.get("product"), r.get("score", 0), now, scan_id,
                  r.get("model"), _models_json(r), r.get("version"),
                  r.get("verify_result"), r.get("verify_detail"),
                  r.get("latency_ms"), r.get("asn"), r.get("as_name"),
                  r.get("bgp_prefix"), r.get("net_type"), r.get("error"),
-                 _flags_json(r)))
+                 _flags_json(r), _tls_json(r)))
         conn.commit()
         conn.close()
     except Exception:
@@ -361,8 +380,8 @@ def store_scan_result(d, scan_id=None):
             "INSERT OR REPLACE INTO targets "
             "(ip,port,verdict,product,score,scanned_at,fp,scan_id,"
             "model,models_served,version,verify_result,verify_detail,"
-            "latency_ms,asn,as_name,bgp_prefix,net_type,error,flags) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "latency_ms,asn,as_name,bgp_prefix,net_type,error,flags,tls) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (parts[0], int(parts[1]), d.get("verdict", "DARK"),
              d.get("product"), d.get("score", 0), time.time(),
              fingerprint_hash(d), scan_id,
@@ -370,7 +389,7 @@ def store_scan_result(d, scan_id=None):
              d.get("verify_result"), d.get("verify_detail"),
              d.get("latency_ms"), d.get("asn"), d.get("as_name"),
              d.get("bgp_prefix"), d.get("net_type"), d.get("error"),
-             _flags_json(d)))
+             _flags_json(d), _tls_json(d)))
         conn.commit()
         conn.close()
     except Exception:

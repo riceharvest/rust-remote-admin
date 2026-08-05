@@ -14,6 +14,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .config import (
     PROBE_TIMEOUT, PROBE_PATHS, FRAMEWORKS, SCANS, HISTORY, STATE_DB,
 )
+from .alert import (
+    WATCHES as _ALERT_WATCHES,
+    generate_alerts as _generate_alerts,
+    resolve_scan_pair as _resolve_scan_pair,
+)
 from .db import list_scans
 from .engine import scan_events
 from .imports import import_file
@@ -185,6 +190,26 @@ PAGE = r"""<!DOCTYPE html>
   .score-cell { position: relative; cursor: help; }
   .score-tooltip { display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #0a120a; border: 1px solid var(--line); padding: 6px 8px; font-size: 10px; white-space: pre-wrap; z-index: 10; min-width: 180px; max-width: 300px; color: var(--phos-dim); pointer-events: none; margin-bottom: 4px; }
   .score-cell:hover .score-tooltip { display: block; }
+  /* alerts panel */
+  #alerts-toggle { cursor: pointer; user-select: none; }
+  #alerts-body.collapsed { display: none; }
+  #alerts-table { margin-top: 4px; }
+  #alerts-table th, #alerts-table td { padding: 4px 8px; font-size: 11.5px; }
+  tr.alerts-row { cursor: pointer; }
+  tr.alerts-row:hover td { background: #0d1f0d; }
+  .alerts-sev {
+    display: inline-block; padding: 1px 7px; font-size: 9.5px; font-weight: bold;
+    letter-spacing: .15em; border-radius: 3px; border: 1px solid;
+  }
+  .alerts-sev.high { color: var(--red); border-color: var(--red); background: #3a0a0a; text-shadow: 0 0 6px rgba(255,51,51,.5); }
+  .alerts-sev.medium { color: var(--amber); border-color: var(--amber); background: #3a2a0a; }
+  .alerts-sev.low { color: #999; border-color: #444; background: #151515; }
+  .alerts-kind { color: var(--phos-dim); letter-spacing: .1em; font-size: 10.5px; }
+  .alerts-change { font-size: 11px; }
+  .alerts-change .from { color: var(--red); }
+  .alerts-change .to { color: var(--phos); }
+  #alerts-note { color: var(--amber); font-size: 10.5px; letter-spacing: .08em; }
+  #alerts-empty { color: #4a6a4a; font-size: 11px; letter-spacing: .15em; padding: 8px 2px; }
 </style>
 </head>
 <body class="adv">
@@ -415,6 +440,29 @@ PAGE = r"""<!DOCTYPE html>
       <select id="hist" style="min-width:340px"></select>
       <button id="hist-load" class="small">Load</button>
       <button id="hist-refresh" class="small">Refresh List</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2 id="alerts-toggle"><span id="alerts-caret">&#9656;</span> ALERTS <span id="alerts-count" class="hint" style="margin-left:6px"></span></h2>
+    <div id="alerts-body">
+      <div class="fltbox" style="gap:8px">
+        <button id="alerts-refresh" class="small">REFRESH</button>
+        <select id="alerts-watch" style="margin-top:0;font-size:11px">
+          <option value="">ALL WATCHES</option>
+          <option value="new">NEW</option>
+          <option value="flip">FLIP</option>
+          <option value="model">MODEL</option>
+          <option value="tls">TLS</option>
+          <option value="verify">VERIFY</option>
+        </select>
+        <span id="alerts-note" class="hint"></span>
+      </div>
+      <table id="alerts-table">
+        <thead><tr><th>SEVERITY</th><th>KIND</th><th>TARGET</th><th>CHANGE</th></tr></thead>
+        <tbody id="alerts-rows"></tbody>
+      </table>
+      <div id="alerts-empty">no alerts &mdash; run two scans to compare</div>
     </div>
   </div>
 
@@ -1476,6 +1524,7 @@ $('go').onclick = async () => {
     refreshProductSelect(); renderDossiers(); drawCharts(); updateIntel();
     refreshTrendChart();
     refreshCompareSelects();
+    refreshAlerts();
     $('export').style.display = 'inline-block';
     $('exportcsv').style.display = 'inline-block';
     $('retarget').style.display = 'inline-block';
@@ -1570,9 +1619,80 @@ $('hist-load').onclick = async () => {
   $('retarget').style.display = 'inline-block';
   log(`archive loaded: ${S.results.length} dossier(s) from ${id}.`);
 };
+// ---------- alerts panel ----------
+// Security-relevant changes between the two most recent scans (or an explicit
+// baseline/current pair), served by the alert module via /api/alerts. This is
+// a read-only view — the CLI owns stateful dedup, so REFRESH always shows the
+// latest diff.
+const ALERT_KIND_LABEL = {
+  NEW: 'NEW', VERDICT_FLIP: 'FLIP', MODEL_CHANGE: 'MODEL',
+  TLS_DROP: 'TLS', VERIFY_REGRESSION: 'VERIFY',
+};
+function alertChangeHtml(a) {
+  const old = a.old == null ? '-' : a.old;
+  const nw = a.new == null ? '-' : a.new;
+  if (a.kind === 'NEW') return `<span class="to">appeared as ${esc(nw)}</span>`;
+  return `<span class="from">${esc(old)}</span> &rarr; <span class="to">${esc(nw)}</span>`;
+}
+function alertRowFor(a) {
+  const tr = document.createElement('tr');
+  tr.className = 'alerts-row';
+  const sev = a.severity || 'low';
+  const kind = ALERT_KIND_LABEL[a.kind] ||
+    String(a.kind || a.watch || '?').toUpperCase().replace(/_/g, ' ');
+  tr.innerHTML =
+    `<td><span class="alerts-sev ${esc(sev)}">${esc(sev.toUpperCase())}</span></td>` +
+    `<td><span class="alerts-kind">${esc(kind)}</span></td>` +
+    `<td>${esc(a.target)}</td>` +
+    `<td class="alerts-change">${alertChangeHtml(a)}</td>`;
+  // clicking a target reuses the console's search-box filter mechanism
+  tr.onclick = () => {
+    $('ftext').value = a.target;
+    S.filter.text = a.target.toLowerCase();
+    S.page = 0;
+    renderDossiers();
+    $('dossiers').scrollIntoView({behavior: 'smooth', block: 'start'});
+  };
+  return tr;
+}
+async function refreshAlerts() {
+  const rowsEl = $('alerts-rows');
+  const noteEl = $('alerts-note');
+  const emptyEl = $('alerts-empty');
+  const btn = $('alerts-refresh');
+  const w = $('alerts-watch').value;
+  if (btn) btn.disabled = true;
+  try {
+    const params = new URLSearchParams();
+    if (w) params.set('watch', w);
+    const qs = params.toString();
+    const r = await fetch('/api/alerts' + (qs ? '?' + qs : ''));
+    const d = await r.json();
+    const alerts = Array.isArray(d.alerts) ? d.alerts : [];
+    $('alerts-count').textContent = alerts.length ? '(' + alerts.length + ')' : '';
+    noteEl.textContent = d.note || '';
+    rowsEl.innerHTML = '';
+    emptyEl.style.display = alerts.length ? 'none' : '';
+    for (const a of alerts) rowsEl.appendChild(alertRowFor(a));
+  } catch (e) {
+    noteEl.textContent = 'alerts fetch failed: ' + e;
+    emptyEl.style.display = '';
+    rowsEl.innerHTML = '';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+$('alerts-refresh').onclick = refreshAlerts;
+$('alerts-watch').onchange = refreshAlerts;
+$('alerts-toggle').onclick = () => {
+  const closed = $('alerts-body').classList.toggle('collapsed');
+  $('alerts-caret').textContent = closed ? '\u25BE' : '\u25B6';
+};
+
 refreshHistory();
 refreshTrendChart();
 refreshCompareSelects();
+refreshAlerts();
 </script>
 </body>
 </html>
@@ -1828,6 +1948,51 @@ def _classify_diff(rows_a, rows_b):
     }
 
 
+def _scan_id_param(qs, name):
+    """Parse a numeric scan-id query param; None when absent/invalid."""
+    raw = (qs.get(name, [""])[0] or "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _api_alerts(path):
+    """GET /api/alerts — security-relevant changes between two scans.
+
+    Defaults to the two most recent scans (alert.resolve_scan_pair); an
+    explicit ?baseline=N&current=M pair overrides that, and ?watch=new,flip,...
+    narrows the watched kinds. Always returns a JSON-ready dict (200): with no
+    scans on record the console gets ``{"alerts": [], "note": "no scans yet"}``
+    rather than an error.
+    """
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    watch = None
+    raw_watch = (qs.get("watch", [""])[0] or "").strip()
+    if raw_watch:
+        watch = {w for w in raw_watch.split(",") if w.strip() in _ALERT_WATCHES}
+        if not watch:
+            return {"alerts": [], "note": "unknown watch kind(s)"}
+    baseline = _scan_id_param(qs, "baseline")
+    current = _scan_id_param(qs, "current")
+    try:
+        if baseline is None and current is None:
+            baseline, current = _resolve_scan_pair(STATE_DB)
+            if baseline is None or current is None:
+                return {"alerts": [], "note": "no scans yet"}
+        alerts = _generate_alerts(
+            db_path=STATE_DB,
+            baseline_scan_id=baseline,
+            current_scan_id=current,
+            watch=watch,
+            use_state=False,  # console is a read-only view; CLI owns dedup state
+        )
+    except FileNotFoundError:
+        return {"alerts": [], "note": "no scans yet"}
+    except ValueError as e:
+        return {"alerts": [], "note": str(e)}
+    except Exception as e:  # never 500 the console
+        return {"alerts": [], "note": f"alerts unavailable: {e}"}
+    return {"alerts": alerts, "baseline": baseline, "current": current}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - silence request logging
         pass
@@ -1915,6 +2080,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(d))
             except Exception as e:
                 self._send(400, json.dumps({"error": str(e)}))
+        elif self.path.startswith("/api/alerts"):
+            self._send(200, json.dumps(_api_alerts(self.path)))
         else:
             self._send(404, '{"error":"not found"}')
 

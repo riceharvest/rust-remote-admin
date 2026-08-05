@@ -45,13 +45,13 @@ CSV_COLUMNS = [
 ]
 
 # Rich dropped-field/persisted columns the targets table may carry (schema
-# v2+, plus the v3 flags column). Selected dynamically in load_db_results so
-# legacy v0 tables (no such columns) still load — the fields are simply
-# absent from those rows.
+# v2+, plus the v3 flags and v4 tls columns). Selected dynamically in
+# load_db_results so legacy v0 tables (no such columns) still load — the
+# fields are simply absent from those rows.
 _RICH_COLUMNS = [
     "model", "models_served", "version", "verify_result", "verify_detail",
     "latency_ms", "asn", "as_name", "bgp_prefix", "net_type", "error",
-    "flags",
+    "flags", "tls",
 ]
 
 # Canonical JSON result fields, in display order, for render_json / diff rows.
@@ -165,6 +165,14 @@ def load_db_results(scan_id=None, db_path=None):
                         v = json.loads(v)
                     except (TypeError, ValueError):
                         v = []
+            elif c == "tls":
+                if v is None:
+                    v = None
+                elif not isinstance(v, dict):
+                    try:
+                        v = json.loads(v)
+                    except (TypeError, ValueError):
+                        v = None
             r[c] = v
         results.append(r)
     meta = {"source": "sqlite history", "scan_id": scan_id}

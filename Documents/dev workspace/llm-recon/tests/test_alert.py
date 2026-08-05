@@ -256,6 +256,32 @@ class AlertTestCase(unittest.TestCase):
         self.assertTrue(alert._tls_enabled({"port": 8000, "tls": '{"enabled": true}'}))
         self.assertFalse(alert._tls_enabled({"port": 8000, "tls": '{"enabled": false}'}))
 
+    def test_tls_enabled_true_to_false_fires_tls_drop_same_port(self):
+        a = self.add_scan()
+        b = self.add_scan()
+        # same port (443); persisted tls.enabled flips true -> false, so the
+        # persisted value (not the port-443 fallback) drives the TLS_DROP.
+        self.add_target("10.0.0.9", 443, a, "GENUINE", "vllm",
+                        tls='{"enabled": true}')
+        self.add_target("10.0.0.9", 443, b, "GENUINE", "vllm",
+                        tls='{"enabled": false}')
+        alerts = alert.generate_alerts(self.db_path, a, b, use_state=False)
+        td = self.by_kind(alerts)["TLS_DROP"]
+        self.assertEqual(td["target"], "10.0.0.9:443")
+        self.assertEqual((td["old"], td["new"]), ("TLS", "plaintext"))
+        self.assertEqual(td["severity"], "high")
+
+    def test_tls_enabled_true_to_missing_fires_tls_drop(self):
+        a = self.add_scan()
+        b = self.add_scan()
+        # scan B lacks persisted tls entirely (NULL) and port is not 443, so
+        # the 'true -> absent' case still fires TLS_DROP via the fallback.
+        self.add_target("10.0.0.10", 8000, a, "GENUINE", "vllm",
+                        tls='{"enabled": true}')
+        self.add_target("10.0.0.10", 8000, b, "GENUINE", "vllm", tls=None)
+        alerts = alert.generate_alerts(self.db_path, a, b, use_state=False)
+        self.assertIn("TLS_DROP", self.by_kind(alerts))
+
 
 if __name__ == "__main__":
     unittest.main()

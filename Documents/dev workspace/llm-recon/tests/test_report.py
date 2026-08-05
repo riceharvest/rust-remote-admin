@@ -263,6 +263,20 @@ class LoadDbResultsRichTest(ReportTestCase):
                          ["IMPORTED_SHODAN", "CLOUD_ONLY"])
         self.assertEqual(by_target["2.2.2.2:8000"]["flags"], [])
 
+    def test_db_tls_round_trip_and_legacy_null_loads_none(self):
+        tls = {"enabled": True, "fingerprint_sha256": "c" * 64,
+               "issuer": "CN=x", "subject": "CN=x",
+               "not_after": "2027-01-01 00:00:00 UTC", "self_signed": True}
+        sid = self._seed_scan([
+            {"target": "1.1.1.1:8000", "verdict": "GENUINE", "product": "vllm",
+             "tls": tls},
+            {"target": "2.2.2.2:8000", "verdict": "UNKNOWN"},  # NULL tls
+        ])
+        results, _ = report.load_db_results(sid)
+        by_target = {r["target"]: r for r in results}
+        self.assertEqual(by_target["1.1.1.1:8000"]["tls"], tls)
+        self.assertIsNone(by_target["2.2.2.2:8000"]["tls"])
+
     def test_db_backed_report_renders_flags_in_html(self):
         sid = self._seed_scan([
             {"target": "1.1.1.1:8000", "verdict": "GENUINE", "product": "vllm",

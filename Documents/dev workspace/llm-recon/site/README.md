@@ -27,6 +27,48 @@ python3 -m srecon publish --lag-days 7     # exclude rows scanned in the last 7 
 Until you run publish, `data/` only contains `.gitkeep` and the page shows
 dimmed "no data yet — run srecon publish" placeholders.
 
+## Pipeline: scan → publish → site in one command
+
+`python3 -m srecon pipeline` runs the scan engine once (in-process), writes the
+k-anonymized feed, and prints the site deployment instructions — the whole
+regeneration loop in a single, cron-friendly command:
+
+```bash
+# from the repository root: scan hetzner + publish, feed trails by a week
+python3 -m srecon pipeline --pack hetzner --framework all \
+    --out-dir site/data --min-bucket 5 --lag-days 7
+```
+
+It accepts the same target/framework/engine flags as `scan` (`--targets`,
+`--pack`, `--cidrs`, `--targets-file`, `--framework`, `--workers`, `--timeout`,
+`--no-tls`, ...) plus the `publish` knobs (`--out-dir`, `--min-bucket`,
+`--lag-days`, `--db`). The scan and the publish share one engine run — nothing
+is scanned twice — and the final summary prints the `scan_id` (for
+`report --scan-id N`), the publish file list, and the `NEXT:` deploy hint.
+
+### One-shot shell wrapper (cron)
+
+`scripts/pipeline.sh` wraps the pipeline with production defaults
+(pack=hetzner, framework=all, out-dir=site/data, min-bucket=5, lag-days=7) and
+is safe to run from cron: `set -euo pipefail`, no TTY, no prompts. It prints
+`NEXT: deploy site/ to your static host` when it finishes.
+
+```bash
+bash scripts/pipeline.sh          # defaults
+SRECON_LAG_DAYS=0 bash scripts/pipeline.sh   # publish immediately, no lag
+```
+
+### Cron example — daily at 03:00
+
+```cron
+# scan + regenerate the census feed every night; deploy happens separately
+0 3 * * *  cd /home/dario/Documents/dev\ workspace/llm-recon && bash scripts/pipeline.sh >> /home/dario/Documents/dev\ workspace/llm-recon/logs/pipeline.log 2>&1
+```
+
+(`logs/` must exist or the redirect fails; cron emails the log if you omit the
+redirect.) The lag-days=7 default keeps the public feed one week behind the
+live census as a privacy buffer.
+
 ## Run it locally
 
 Serving over `http://` is **required** — the page fetches `data/*.json` with

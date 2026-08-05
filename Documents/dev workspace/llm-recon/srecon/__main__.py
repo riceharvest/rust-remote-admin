@@ -15,6 +15,7 @@ Usage:
     python3 -m srecon packs
     python3 -m srecon frameworks
     python3 -m srecon publish [--out-dir site/data] [--min-bucket 5] [--lag-days 0]
+    python3 -m srecon pipeline --pack hetzner --framework all --out-dir site/data [--min-bucket 5] [--lag-days 7]
     python3 -m srecon serve --port 7777
 
 All output is machine-parseable JSON/NDJSON by default.
@@ -254,9 +255,13 @@ def cmd_import(args):
               f"errors={counts['errors']}")
 
 
-def cmd_scan(args):
-    """Run a scan and stream results as NDJSON (or print a summary table)."""
-    # --- resolve targets ---
+def _resolve_target_lines(args):
+    """Expand --targets/--pack/--cidrs/--targets-file into a list of target lines.
+
+    Exits 1 with a stderr message when no targets resolve (mirrors scan). Shared
+    by the ``scan`` and ``pipeline`` subcommands so the pipeline runs the exact
+    same target resolution once, in-process.
+    """
     lines = []
     if args.targets:
         for chunk in args.targets.split(","):
@@ -297,16 +302,33 @@ def cmd_scan(args):
     if not lines:
         _eprint("error: no targets specified. Use --targets, --pack, --cidrs, or --targets-file.")
         sys.exit(1)
+    return lines
 
-    # --- resolve frameworks ---
-    frameworks = None
-    if args.framework:
-        frameworks = [f.strip().lower() for f in args.framework.split(",") if f.strip()]
-        unknown = [f for f in frameworks if f not in FRAMEWORKS]
-        if unknown:
-            _eprint(f"error: unknown framework(s): {', '.join(unknown)}")
-            _eprint(f"available: {', '.join(sorted(FRAMEWORKS))}")
-            sys.exit(1)
+
+def _resolve_frameworks(args):
+    """Validate --framework and return the filter list, or None for all frameworks.
+
+    ``all`` is a convenient alias for "no filter" (probe every framework). Exits
+    1 on any unknown framework name. Shared by ``scan`` and ``pipeline``.
+    """
+    if not args.framework:
+        return None
+    frameworks = [f.strip().lower() for f in args.framework.split(",") if f.strip()]
+    if "all" in frameworks:
+        return None
+    unknown = [f for f in frameworks if f not in FRAMEWORKS]
+    if unknown:
+        _eprint(f"error: unknown framework(s): {', '.join(unknown)}")
+        _eprint(f"available: {', '.join(sorted(FRAMEWORKS))}")
+        sys.exit(1)
+    return frameworks
+
+
+def cmd_scan(args):
+    """Run a scan and stream results as NDJSON (or print a summary table)."""
+    # --- resolve targets + frameworks (shared resolver) ---
+    lines = _resolve_target_lines(args)
+    frameworks = _resolve_frameworks(args)
 
     # --- raise fd limit ---
     soft = raise_fd_limit()
@@ -485,18 +507,130 @@ def cmd_publish(args):
           f"(min_bucket={manifest['min_bucket']}, lag_days={manifest['lag_days']})")
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        prog="srecon",
-        description="Silicon Recon — LLM inference endpoint discovery and classification.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    sub = ap.add_subparsers(dest="command", help="sub-command help")
+def cmd_pipeline(args):
+    """One-shot scan -> publish -> site pipeline.
 
-    # --- scan ---
-    p_scan = sub.add_parser("scan", help="Run a scan against targets")
-    tgt = p_scan.add_argument_group("target selection (combine freely)")
+    Runs the engine exactly once, in-process (no double engine run), then writes
+    the k-anonymized aggregate feed (``export_aggregates``) and prints the static
+    site regeneration instructions. This is the cron-friendly entry point used by
+    ``scripts/pipeline.sh``.
+    """
+    from .publish import export_aggregates
+
+    lines = _resolve_target_lines(args)
+    frameworks = _resolve_frameworks(args)
+
+    soft = raise_fd_limit()
+    if soft:
+        _eprint(f"[pipeline] fd limit: {soft} (worker cap: {(soft-256)//4})")
+
+    results = []
+    total = 0
+    scan_id = None
+    t_start = time.time()
+
+    # --- run the scan ONCE, in-process ---
+    for ev in scan_events(
+        lines,
+        workers=args.workers,
+        timeout=args.timeout,
+        cancel=None,
+        frameworks=frameworks,
+        excludes=None,
+        enrich=args.enrich,
+        fast=args.fast,
+        lean_ports=args.lean_ports,
+        exclude_dod=not args.include_dod,
+        dedup=args.dedup,
+        asn_prefilter=args.asn_prefilter,
+        fanout=args.fanout,
+        progressive=args.progressive,
+        banner_prefilter=args.banner_prefilter,
+        adaptive_timeout=args.adaptive_timeout,
+        content_dedup=args.content_dedup,
+        diff_mode=args.diff_mode,
+        ptr_seed=args.ptr_seed,
+        ct_search_seed=args.ct_seed,
+        shodan_seed=args.shodan_seed,
+        sweep_all_ports=args.sweep_all_ports,
+        verify=args.verify,
+        tls=args.tls,
+    ):
+        etype = ev["type"]
+        if etype == "start":
+            total = ev["total"]
+            if not args.quiet:
+                _eprint(f"[pipeline] probing {total} targets on ports {ev.get('ports', [])}")
+        elif etype == "result":
+            results.append(ev["data"])
+        elif etype == "enrich":
+            for r in results:
+                if r["target"] == ev["target"]:
+                    r["asn"] = ev.get("asn")
+                    r["as_name"] = ev.get("as_name")
+                    r["bgp_prefix"] = ev.get("bgp_prefix")
+                    r["net_type"] = ev.get("net_type")
+                    break
+        elif etype == "ptr":
+            for r in results:
+                if r["target"] == ev["target"]:
+                    r["ptr"] = ev.get("ptr")
+                    break
+        elif etype == "log":
+            if not args.quiet:
+                _eprint(f"  {ev.get('message', '')}")
+        elif etype in ("done", "stopped"):
+            if ev.get("scan_id") is not None:
+                scan_id = ev["scan_id"]
+
+    elapsed = round(time.time() - t_start, 1)
+
+    # --- publish k-anonymized aggregates (reads the scan DB) ---
+    try:
+        manifest = export_aggregates(
+            db_path=args.db, min_bucket=args.min_bucket,
+            lag_days=args.lag_days, out_dir=args.out_dir)
+    except FileNotFoundError as e:
+        _eprint(f"error: {e}")
+        sys.exit(1)
+
+    # --- emit the pipeline-complete summary + site instructions ---
+    genuine = sum(1 for r in results if r.get("verdict") == "GENUINE")
+    impostor = sum(1 for r in results if r.get("verdict") == "IMPOSTOR")
+    unknown = sum(1 for r in results if r.get("verdict") == "UNKNOWN")
+    dark = sum(1 for r in results if r.get("verdict") == "DARK")
+    error = sum(1 for r in results if r.get("verdict") == "ERROR")
+
+    b = manifest["buckets"]
+    print("=" * 70)
+    print(f"PIPELINE COMPLETE — {len(results)} results in {elapsed}s "
+          f"({total} targets probed)")
+    print(f"  GENUINE:   {genuine}")
+    print(f"  IMPOSTOR:  {impostor}")
+    print(f"  UNKNOWN:   {unknown}")
+    print(f"  DARK:      {dark}")
+    print(f"  ERROR:     {error}")
+    if scan_id is not None:
+        print(f"  SCAN ID:   {scan_id}")
+    print(f"  publish:   {len(manifest['files'])} file(s) -> {manifest['out_dir']} "
+          f"(targets={b['targets']} live={b['live']} "
+          f"min_bucket={manifest['min_bucket']} lag_days={manifest['lag_days']})")
+    for path in manifest["files"]:
+        print(f"    {path}")
+    print("=" * 70)
+    print("NEXT: deploy site/ to your static host")
+    print("  e.g.  rsync -av site/ user@host:/var/www/silicon-recon/")
+    print("  (site/index.html + site/style.css + site/app.js consume site/data/*.json)")
+
+
+def _add_scan_args(p):
+    """Attach the shared target-selection and scan-option groups.
+
+    Used by both the ``scan`` and ``pipeline`` subcommands so they accept the
+    same target/framework/engine flags (targets, pack, cidrs, framework, workers,
+    timeout, enrichment/TLS/dedup toggles, ...).
+    """
+    tgt = p.add_argument_group("target selection (combine freely)")
     tgt.add_argument("--targets", help="Comma-separated host:port or CIDR list")
     tgt.add_argument("--targets-file", help="File with one target/CIDR per line")
     tgt.add_argument("--pack", help="Cloud provider pack(s): comma-separated names (see 'packs')")
@@ -504,8 +638,8 @@ def main():
     tgt.add_argument("--prefix-limit", type=int, default=5000,
                      help="Max prefixes per ASN when resolving packs (default: 5000)")
 
-    fw = p_scan.add_argument_group("scan options")
-    fw.add_argument("--framework", "-f", help="Framework filter: comma-separated (see 'frameworks')")
+    fw = p.add_argument_group("scan options")
+    fw.add_argument("--framework", "-f", help="Framework filter: comma-separated or 'all' (see 'frameworks')")
     fw.add_argument("--workers", "-w", type=int, default=1000, help="Concurrent workers (default: 1000)")
     fw.add_argument("--timeout", type=float, default=PROBE_TIMEOUT, help=f"Per-probe timeout seconds (default: {PROBE_TIMEOUT})")
     fw.add_argument("--sweep-all-ports", action="store_true", help="Probe all 13 known LLM ports regardless of framework filter")
@@ -528,6 +662,19 @@ def main():
     fw.add_argument("--no-tls", dest="tls", action="store_false", default=True,
                     help="Disable TLS probing (port 443 + TLS fallback for nginx-fronted HTTPS)")
 
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="srecon",
+        description="Silicon Recon — LLM inference endpoint discovery and classification.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = ap.add_subparsers(dest="command", help="sub-command help")
+
+    # --- scan ---
+    p_scan = sub.add_parser("scan", help="Run a scan against targets")
+    _add_scan_args(p_scan)
     out = p_scan.add_argument_group("output")
     out.add_argument("--json", dest="ndjson", action="store_true", help="Stream results as NDJSON (machine-readable)")
     out.add_argument("--output", "-o", help="Write JSON results to file")
@@ -652,6 +799,30 @@ def main():
     p_pub.add_argument("--dry-run", action="store_true",
                        help="Print would-write paths without writing anything")
     p_pub.set_defaults(func=cmd_publish)
+
+    # --- pipeline ---
+    p_pipe = sub.add_parser(
+        "pipeline",
+        help="One-shot scan -> publish -> site pipeline "
+             "(runs the engine once in-process, then writes the site feed)")
+    _add_scan_args(p_pipe)
+    p_pipe.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress progress messages")
+    pub = p_pipe.add_argument_group("publish (site feed)")
+    pub.add_argument("--out-dir", default=None, metavar="DIR",
+                     help="Output directory for the site feed JSON "
+                          "(default: site/data/)")
+    pub.add_argument("--min-bucket", type=int, default=5, metavar="N",
+                     help="Minimum count for a published bucket; smaller "
+                          "buckets are suppressed/merged (default: 5)")
+    pub.add_argument("--lag-days", type=int, default=0, metavar="N",
+                     help="Exclude rows scanned within the last N days "
+                          "from the published feed (default: 0 = no lag)")
+    pub.add_argument("--db", default=None, metavar="PATH",
+                     help="History DB path for the publish step "
+                          "(default: srecon/data/state.db; scan persistence "
+                          "always uses the default DB)")
+    p_pipe.set_defaults(func=cmd_pipeline)
 
     args = ap.parse_args()
     if not args.command:

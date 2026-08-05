@@ -75,7 +75,8 @@ class SchemaTest(DbTestCase):
             conn.close()
         expected = {"model", "models_served", "version", "verify_result",
                     "verify_detail", "latency_ms", "asn", "as_name",
-                    "bgp_prefix", "net_type", "error", "scan_id"}
+                    "bgp_prefix", "net_type", "error", "scan_id", "flags",
+                    "tls"}
         self.assertTrue(expected <= cols)
 
     def test_wal_journal_mode_on_connect(self):
@@ -194,9 +195,9 @@ class DropFieldPersistenceTest(DbTestCase):
 
 
 class FlagsMigrationTest(DbTestCase):
-    def test_v3_migration_adds_flags_column_and_preserves_rows(self):
+    def test_migrations_add_flags_and_tls_columns_and_preserve_rows(self):
         # Build a v2 database by hand (migrations 1+2 only), insert a row,
-        # then let _init_db upgrade it to v3.
+        # then let _init_db upgrade it to the latest version (v4).
         conn = sqlite3.connect(db.STATE_DB)
         db._migration_1_base_schema(conn)
         db._migration_2_scans_and_fields(conn)
@@ -214,9 +215,10 @@ class FlagsMigrationTest(DbTestCase):
         finally:
             conn.close()
         self.assertNotIn("flags", {r[1] for r in pre})
-        # runtime upgrade v2 -> v3
+        self.assertNotIn("tls", {r[1] for r in pre})
+        # runtime upgrade v2 -> v4 (migrations 3 + 4)
         db._init_db().close()
-        self.assertEqual(db.schema_version(), 3)
+        self.assertEqual(db.schema_version(), 4)
         conn = sqlite3.connect(db.STATE_DB)
         try:
             count = conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
@@ -228,13 +230,53 @@ class FlagsMigrationTest(DbTestCase):
             conn.close()
         self.assertEqual(count, 1)  # preserved row count
         self.assertIn("flags", cols)  # column added
+        self.assertIn("tls", cols)  # column added
         self.assertEqual(row, ("1.2.3.4", 8080, "GENUINE", "ollama", 12))
 
-    def test_v3_migration_is_idempotent_and_noop_on_existing_rows(self):
-        db._init_db().close()  # fresh DB migrates straight to v3
-        self.assertEqual(db.schema_version(), 3)
+    def test_migrations_are_idempotent_and_noop_on_existing_rows(self):
+        db._init_db().close()  # fresh DB migrates straight to the latest
+        self.assertEqual(db.schema_version(), 4)
         db._init_db().close()
+        self.assertEqual(db.schema_version(), 4)
+
+
+class TlsMigrationTest(DbTestCase):
+    def test_v4_migration_adds_tls_column_and_preserves_rows(self):
+        # Build a v3 database by hand (migrations 1+2+3), insert a row,
+        # then let _init_db upgrade it to v4.
+        conn = sqlite3.connect(db.STATE_DB)
+        db._migration_1_base_schema(conn)
+        db._migration_2_scans_and_fields(conn)
+        db._migration_3_flags(conn)
+        conn.execute("PRAGMA user_version = 3")
+        conn.execute(
+            "INSERT INTO targets (ip,port,verdict,product,score,scanned_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("1.2.3.4", 8080, "GENUINE", "ollama", 12, time.time()))
+        conn.commit()
+        conn.close()
         self.assertEqual(db.schema_version(), 3)
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            pre = conn.execute("PRAGMA table_info(targets)").fetchall()
+        finally:
+            conn.close()
+        self.assertNotIn("tls", {r[1] for r in pre})
+        # runtime upgrade v3 -> v4
+        db._init_db().close()
+        self.assertEqual(db.schema_version(), 4)
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(targets)")}
+            row = conn.execute(
+                "SELECT ip, port, verdict, product, score FROM targets "
+                "WHERE ip='1.2.3.4'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)  # preserved row count
+        self.assertIn("tls", cols)  # column added
+        self.assertEqual(row, ("1.2.3.4", 8080, "GENUINE", "ollama", 12))
 
 
 class FlagsPersistenceTest(DbTestCase):
@@ -276,6 +318,52 @@ class FlagsPersistenceTest(DbTestCase):
         finally:
             conn.close()
         self.assertEqual(json.loads(a), ["IMPORTED_SHODAN"])
+        self.assertIsNone(b)
+
+
+class TlsPersistenceTest(DbTestCase):
+    def test_store_scan_result_round_trips_tls_json(self):
+        tls = {"enabled": True, "fingerprint_sha256": "a" * 64,
+               "issuer": "CN=test", "subject": "CN=test",
+               "not_after": "2027-01-01 00:00:00 UTC", "self_signed": True}
+        db.store_scan_result({
+            "target": "1.2.3.4:443", "verdict": "GENUINE",
+            "product": "vllm", "tls": tls})
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            stored = conn.execute(
+                "SELECT tls FROM targets WHERE ip='1.2.3.4'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(stored), tls)
+
+    def test_store_scan_result_missing_tls_keeps_null(self):
+        db.store_scan_result({"target": "1.2.3.4:8080", "verdict": "DARK"})
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            tls = conn.execute(
+                "SELECT tls FROM targets WHERE ip='1.2.3.4'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsNone(tls)
+
+    def test_store_results_round_trips_tls(self):
+        tls = {"enabled": True, "fingerprint_sha256": "b" * 64,
+               "issuer": None, "subject": None, "not_after": None,
+               "self_signed": None}
+        db.store_results([
+            {"target": "1.2.3.4:443", "verdict": "GENUINE", "tls": tls},
+            {"target": "2.3.4.5:11434", "verdict": "UNKNOWN"},  # no tls
+        ])
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            a = conn.execute(
+                "SELECT tls FROM targets WHERE ip='1.2.3.4'").fetchone()[0]
+            b = conn.execute(
+                "SELECT tls FROM targets WHERE ip='2.3.4.5'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(a), tls)
         self.assertIsNone(b)
 
 
