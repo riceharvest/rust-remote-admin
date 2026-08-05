@@ -8,7 +8,7 @@ Usage:
     python3 -m srecon report --scan-id 5 --format json --scans
     python3 -m srecon scans [--last 10] [--json]
     python3 -m srecon diff 1 2 [--json]
-    python3 -m srecon alerts [--baseline N] [--current N] [--watch new,flip,model,tls,verify] [--json] [--no-state] [--state PATH]
+    python3 -m srecon alerts [--baseline N] [--current N] [--watch new,flip,model,tls,verify] [--min-severity high|medium|low] [--json] [--no-state] [--state PATH] [--notify] [--notify-config PATH]
     python3 -m srecon import shodan.jsonl [--format shodan] [--scan-id 6] [--dry-run]
     python3 -m srecon prefixes --asn 24940
     python3 -m srecon cidrs --cc DE
@@ -22,10 +22,11 @@ All output is machine-parseable JSON/NDJSON by default.
 """
 import argparse
 import json
+import os
 import sys
 import time
 
-from .config import FRAMEWORKS, DEFAULT_PORTS, PROBE_TIMEOUT
+from .config import DATA_DIR, FRAMEWORKS, DEFAULT_PORTS, PROBE_TIMEOUT
 from .engine import scan_events
 from .packs import PACKS
 from .serve import raise_fd_limit
@@ -199,6 +200,20 @@ def cmd_alerts(args):
     """Emit security-relevant change alerts between a baseline and current scan."""
     from .alert import WATCHES, generate_alerts, render_alerts_human
 
+    notify_cfg = None
+    if args.notify:
+        cfg_path = args.notify_config or os.path.join(DATA_DIR, "notify.json")
+        if not os.path.exists(cfg_path):
+            _eprint(f"no notify config at {cfg_path} "
+                    f"— create one (see --help)")
+            sys.exit(2)
+        try:
+            with open(cfg_path) as f:
+                notify_cfg = json.load(f)
+        except (OSError, ValueError) as e:
+            _eprint(f"error: cannot read notify config {cfg_path}: {e}")
+            sys.exit(2)
+
     watch = None
     if args.watch:
         watch = [w.strip().lower() for w in args.watch.split(",") if w.strip()]
@@ -218,6 +233,7 @@ def cmd_alerts(args):
             watch=watch,
             state_path=args.state,
             use_state=not args.no_state,
+            min_severity=args.min_severity,
         )
     except (FileNotFoundError, ValueError) as e:
         _eprint(f"error: {e}")
@@ -229,6 +245,16 @@ def cmd_alerts(args):
             print(json.dumps(a))
     else:
         print(render_alerts_human(alerts))
+    if args.notify and notify_cfg is not None:
+        from .notify import deliver
+        results = deliver(alerts, notify_cfg)
+        if not results:
+            _eprint("notify: no channels configured in notify config")
+        for channel, res in sorted(results.items()):
+            if res.get("ok"):
+                _eprint(f"notify: {channel} delivered {len(alerts)} alert(s)")
+            else:
+                _eprint(f"notify: {channel} failed: {res.get('error')}")
 
 
 def cmd_import(args):
@@ -759,6 +785,10 @@ def main():
     p_alert.add_argument("--watch", default=None, metavar="KINDS",
                          help="Comma-separated watch kinds: "
                               "new,flip,model,tls,verify (default: all)")
+    p_alert.add_argument("--min-severity", choices=["high", "medium", "low"],
+                         default=None, metavar="LEVEL",
+                         help="Only emit alerts at or above this severity "
+                              "(high > medium > low; default: all)")
     p_alert.add_argument("--json", action="store_true",
                          help="Emit one alert per line as NDJSON")
     p_alert.add_argument("--no-state", action="store_true",
@@ -766,6 +796,12 @@ def main():
     p_alert.add_argument("--state", default=None, metavar="PATH",
                          help="State file path (default: alerts_state.json "
                               "next to the DB)")
+    p_alert.add_argument("--notify", action="store_true",
+                         help="After printing, deliver alerts via the channels "
+                              "configured in the notify config")
+    p_alert.add_argument("--notify-config", default=None, metavar="PATH",
+                         help="Notify config JSON path "
+                              "(default: srecon/data/notify.json)")
     p_alert.add_argument("--db", default=None, metavar="PATH",
                          help="History DB path (default: srecon/data/state.db)")
     p_alert.set_defaults(func=cmd_alerts)

@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Silicon Recon — Argus eye server mark">
+  <!-- cream engraved plate -->
+  <rect width="64" height="64" fill="#f4f1e8"/>
+  <rect x="3" y="3" width="58" height="58" rx="2" fill="none" stroke="#1a1a18" stroke-width="1"/>
+  <rect x="7" y="7" width="50" height="50" rx="1.5" fill="none" stroke="#1a1a18" stroke-width="0.5" opacity="0.35"/>
+  <!-- status LEDs, corner-mounted like a rack face -->
+  <circle cx="12" cy="12" r="1.3" fill="#1a2ee6"/>
+  <circle cx="52" cy="12" r="1.3" fill="#1a2ee6"/>
+  <circle cx="12" cy="52" r="1.3" fill="#1a2ee6"/>
+  <circle cx="52" cy="52" r="1.3" fill="#1a2ee6"/>
+  <!-- the eye of Argus -->
+  <path d="M 32 20 C 38.5 25.5 38.5 38.5 32 44 C 25.5 38.5 25.5 25.5 32 20 Z" fill="#1a2ee6"/>
+  <circle cx="32" cy="32" r="8" fill="#f4f1e8" stroke="#1a1a18" stroke-width="0.8"/>
+  <circle cx="32" cy="32" r="4" fill="#1a1a18"/>
+  <circle cx="33.5" cy="30.5" r="1.1" fill="#f4f1e8"/>
+  <!-- engraved cilia -->
+  <g stroke="#1a2ee6" stroke-width="0.8" opacity="0.75">
+    <line x1="32" y1="20" x2="32" y2="15"/>
+    <line x1="36.5" y1="27.5" x2="39.5" y2="24.5"/>
+    <line x1="37" y1="32" x2="41.5" y2="32"/>
+    <line x1="36.5" y1="36.5" x2="39.5" y2="39.5"/>
+    <line x1="32" y1="44" x2="32" y2="49"/>
+    <line x1="27.5" y1="36.5" x2="24.5" y2="39.5"/>
+    <line x1="27" y1="32" x2="22.5" y2="32"/>
+    <line x1="27.5" y1="27.5" x2="24.5" y2="24.5"/>
+  </g>
+  <!-- rack vent ticks -->
+  <g stroke="#1a1a18" stroke-width="0.6" opacity="0.5">
+    <line x1="16" y1="51" x2="48" y2="51"/>
+    <line x1="16" y1="53.5" x2="48" y2="53.5"/>
+    <line x1="16" y1="56" x2="48" y2="56"/>
+  </g>
+</svg>

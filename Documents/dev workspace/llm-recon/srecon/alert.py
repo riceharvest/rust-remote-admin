@@ -351,7 +351,8 @@ def resolve_scan_pair(db_path=None, baseline_scan_id=None, current_scan_id=None)
 
 
 def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
-                    watch=None, state_path=None, use_state=True):
+                    watch=None, state_path=None, use_state=True,
+                    min_severity=None):
     """Generate security-relevant change alerts between two scans.
 
     Loads the baseline/current scan snapshots from SQLite, emits an alert per
@@ -359,14 +360,22 @@ def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
     ``use_state`` is False) records ``current scan_id`` in ``state_path`` so
     repeated runs do not re-emit the same batch.
 
+    ``min_severity`` (optional) keeps only alerts at or above that severity,
+    in the order ``high > medium > low``. E.g. ``min_severity="medium"``
+    returns high and medium alerts but drops low ones.
+
     Returns a list of alert dicts:
         {target, kind, watch, old, new, scan_id_b, severity}
     Emits nothing ([]) when there are no alerts or the state already consumed
     the current scan.
 
     Raises ``FileNotFoundError`` for a missing DB and ``ValueError`` for an
-    unknown scan_id or watch kind.
+    unknown scan_id, watch kind, or severity.
     """
+    if min_severity is not None and min_severity not in _SEVERITY_RANK:
+        raise ValueError(
+            f"unknown severity: {min_severity} "
+            f"(available: {', '.join(sorted(_SEVERITY_RANK))})")
     if db_path is None:
         db_path = STATE_DB
     baseline, current = resolve_scan_pair(
@@ -382,6 +391,11 @@ def generate_alerts(db_path=None, baseline_scan_id=None, current_scan_id=None,
     rows_a = _load_targets(db_path, baseline)
     rows_b = _load_targets(db_path, current)
     alerts = _diff_alerts(rows_a, rows_b, scan_id_b=current, watch=watch)
+
+    if min_severity is not None:
+        threshold = _SEVERITY_RANK[min_severity]
+        alerts = [a for a in alerts
+                  if _SEVERITY_RANK.get(a.get("severity"), 3) <= threshold]
 
     if use_state:
         _save_state(state_path, current)

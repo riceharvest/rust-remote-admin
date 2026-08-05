@@ -9,6 +9,8 @@ site/
 ├── index.html      single-page census dashboard (hero, summary, trend, tables, status bar)
 ├── style.css       "engraved terminal" design system
 ├── app.js          fetches data/*.json and renders; degrades to placeholders when data is absent
+├── favicon.svg     engraved Argus/rack mark (cream plate, ultramarine eye, ink hairlines)
+├── sitemap.xml     minimal sitemap — see "sitemap.xml" below to replace the placeholder URL
 ├── data/           publish output (summary.json, trend.json, frameworks.json, asns.json, geo.json)
 └── README.md
 ```
@@ -85,10 +87,51 @@ python3 -m http.server 8000
 ## Deploy
 
 Any static host works — it is a flat directory with no build step and no
-backend. **Vercel works with zero config**: import the repo, set
-`Root Directory` to `site/`, and the default static output serves
-`index.html` + `data/*.json` as-is. (Netlify, GitHub Pages, S3/CloudFront,
-nginx, etc. all work the same way.)
+backend. For Vercel the repo ships a [`vercel.json`](../vercel.json) at the
+repository root so a one-command deploy serves the census at the domain root:
+
+```bash
+# from the repository root
+npx vercel --prod            # or: vercel deploy --prod  (CLI installed globally)
+```
+
+`vercel.json` pins the pure-static behavior: `framework: null`,
+`buildCommand: null`, `outputDirectory: "site"` (the census lives in `site/`,
+so the deployed root *is* the site — no `Root Directory` override needed),
+and `rewrites: []`. Importing the repo in the Vercel dashboard reads the same
+file automatically.
+
+### Data regeneration & what gets committed
+
+`srecon publish` writes `site/data/*.json`. The repository `.gitignore`
+already ignores `data/` (that pattern matches at any depth), so the JSON feed
+is **never committed** — the deployed numbers are whatever the last `publish`
+wrote before you deployed. Regenerate, then redeploy:
+
+```bash
+python3 -m srecon publish      # writes site/data/*.json
+npx vercel --prod
+```
+
+(If you ever host `site/` in a place where `.gitignore` no longer covers it,
+add `site/data/*.json` to `.gitignore` — the feed must never be committed.)
+
+### Cache headers
+
+`vercel.json` sets two `Cache-Control` regimes:
+
+- **`site/data/*.json` → `no-store`.** Every page load refetches the feed
+  fresh from origin, so a regeneration + redeploy replaces the numbers
+  immediately and no stale census is ever served from CDN or browser cache.
+- **Everything else** (`style.css`, `app.js`, `favicon.svg`, …) →
+  `public, max-age=3600, stale-while-revalidate=86400`. Assets are fresh for
+  an hour, then may be served stale for up to a day while the CDN revalidates
+  in the background — cheap, resilient caching for versionless static files.
+
+### sitemap.xml
+
+`site/sitemap.xml` ships with the placeholder `https://census.example.com/`.
+Replace it with the real site URL before launch.
 
 ## Privacy guarantee
 
