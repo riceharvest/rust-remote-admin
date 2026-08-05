@@ -8,6 +8,7 @@ Usage:
     python3 -m srecon report --scan-id 5 --format json --scans
     python3 -m srecon scans [--last 10] [--json]
     python3 -m srecon diff 1 2 [--json]
+    python3 -m srecon alerts [--baseline N] [--current N] [--watch new,flip,model,tls,verify] [--json] [--no-state] [--state PATH]
     python3 -m srecon import shodan.jsonl [--format shodan] [--scan-id 6] [--dry-run]
     python3 -m srecon prefixes --asn 24940
     python3 -m srecon cidrs --cc DE
@@ -191,6 +192,42 @@ def cmd_diff(args):
         print(json.dumps(d, indent=2, default=str))
     else:
         print(render_diff_human(d))
+
+
+def cmd_alerts(args):
+    """Emit security-relevant change alerts between a baseline and current scan."""
+    from .alert import WATCHES, generate_alerts, render_alerts_human
+
+    watch = None
+    if args.watch:
+        watch = [w.strip().lower() for w in args.watch.split(",") if w.strip()]
+        if not watch:
+            watch = None
+        else:
+            unknown = [w for w in watch if w not in WATCHES]
+            if unknown:
+                _eprint(f"error: unknown watch kind(s): {', '.join(unknown)} "
+                        f"(available: {', '.join(sorted(WATCHES))})")
+                sys.exit(1)
+    try:
+        alerts = generate_alerts(
+            db_path=args.db,
+            baseline_scan_id=args.baseline,
+            current_scan_id=args.current,
+            watch=watch,
+            state_path=args.state,
+            use_state=not args.no_state,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        _eprint(f"error: {e}")
+        sys.exit(1)
+    if not alerts:
+        return  # emit nothing, exit 0
+    if args.json:
+        for a in alerts:
+            print(json.dumps(a))
+    else:
+        print(render_alerts_human(alerts))
 
 
 def cmd_import(args):
@@ -561,6 +598,30 @@ def main():
     p_diff.add_argument("--json", action="store_true",
                         help="Emit machine-readable diff JSON")
     p_diff.set_defaults(func=cmd_diff)
+
+    # --- alerts ---
+    p_alert = sub.add_parser(
+        "alerts",
+        help="Emit security-relevant change alerts between two scans")
+    p_alert.add_argument("--baseline", type=int, metavar="N", default=None,
+                         help="Baseline scan_id (default: older of the two "
+                              "most recent scans)")
+    p_alert.add_argument("--current", type=int, metavar="N", default=None,
+                         help="Current scan_id (default: newer of the two "
+                              "most recent scans)")
+    p_alert.add_argument("--watch", default=None, metavar="KINDS",
+                         help="Comma-separated watch kinds: "
+                              "new,flip,model,tls,verify (default: all)")
+    p_alert.add_argument("--json", action="store_true",
+                         help="Emit one alert per line as NDJSON")
+    p_alert.add_argument("--no-state", action="store_true",
+                         help="Ignore and do not update the dedup state file")
+    p_alert.add_argument("--state", default=None, metavar="PATH",
+                         help="State file path (default: alerts_state.json "
+                              "next to the DB)")
+    p_alert.add_argument("--db", default=None, metavar="PATH",
+                         help="History DB path (default: srecon/data/state.db)")
+    p_alert.set_defaults(func=cmd_alerts)
 
     # --- import ---
     p_imp = sub.add_parser("import",

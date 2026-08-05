@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 LAB_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(LAB_DIR)
@@ -70,10 +71,28 @@ CHECKS = {
     "triton":     ("GENUINE", "triton",        None,     "skipped"),  # no verify schema for triton
     # TLS variant: HTTPS vLLM with self-signed cert (engine TLS fallback active)
     "https-vllm": ("GENUINE", "vllm",          None,     "live"),
+    # Wave 7 TLS expansion: HTTPS ollama + llamacpp (same plaintext surfaces
+    # over TLS, reached via the engine's TLS_FALLBACK path) and the CERT
+    # VARIANT https-vllm-expired (vLLM over TLS serving an EXPIRED cert; the
+    # engine still classifies it because verify_mode=CERT_NONE, only the tls
+    # dict's not_after is in the past — asserted separately below).
+    "https-ollama": ("GENUINE", "ollama",       None,     "live"),
+    "https-llamacpp": ("GENUINE", "llamacpp",   None,     "live"),
+    "https-vllm-expired": ("GENUINE", "vllm",   None,     "live"),
 }
 
+# every TLS fixture must reach the server over an unverified TLS handshake and
+# carry TLS evidence (tls.enabled + fingerprint + TLS_FALLBACK flag), because
+# they are bound to ephemeral ports (not 443) and are only reached via the
+# plaintext-fails -> TLS-fallback path.
+TLS_FIXTURES = frozenset({
+    "https-vllm", "https-ollama", "https-llamacpp", "https-vllm-expired",
+})
+# https-vllm-expired additionally must expose a not_after in the PAST.
+EXPIRED_CERT_FIXTURES = frozenset({"https-vllm-expired"})
+
 VERDICT_COUNTS_REPORT = {
-    "GENUINE":  10,  # vllm, ollama, llamacpp, gateway, sglang, tgi, aphrodite, litellm, triton, https-vllm
+    "GENUINE":  13,  # vllm, ollama, llamacpp, gateway, sglang, tgi, aphrodite, litellm, triton, https-vllm, https-ollama, https-llamacpp, https-vllm-expired
     "IMPOSTOR": 1,   # honeypot
     "UNKNOWN":  1,   # authwall
 }
@@ -258,8 +277,11 @@ def main():
                     problems.append(f"product {got_p!r} must NOT contain {forb_p!r}")
                 if got_x != exp_verify:
                     problems.append(f"verify {got_x!r} != {exp_verify!r}")
-                # https-vllm must have TLS evidence: tls dict + TLS_FALLBACK flag
-                if name == "https-vllm":
+                # TLS fixtures must have TLS evidence: tls dict + TLS_FALLBACK
+                # flag; the expired CERT VARIANT must also expose a past not_after
+                # (an unverified handshake accepts the stale cert, so the engine
+                # still probes + verifies — only the captured date is stale).
+                if name in TLS_FIXTURES:
                     tls_info = rd.get("tls") or {}
                     if not tls_info.get("enabled"):
                         problems.append("tls.enabled missing/false")
@@ -267,6 +289,21 @@ def main():
                         problems.append("tls.fingerprint_sha256 missing")
                     if "TLS_FALLBACK" not in (rd.get("flags") or []):
                         problems.append("TLS_FALLBACK flag missing")
+                    if name in EXPIRED_CERT_FIXTURES:
+                        na = tls_info.get("not_after")
+                        if not na:
+                            problems.append("tls.not_after missing")
+                        else:
+                            try:
+                                na_dt = datetime.strptime(
+                                    na, "%Y-%m-%d %H:%M UTC").replace(
+                                        tzinfo=timezone.utc)
+                                if not (na_dt < datetime.now(timezone.utc)):
+                                    problems.append(
+                                        f"tls.not_after [{na}] not in the past")
+                            except ValueError:
+                                problems.append(
+                                    f"tls.not_after [{na}] unparseable")
                 # db/report round-trip: target present in report with its verdict
                 line = report_row_for(md, f.target)
                 if line is None:
@@ -325,13 +362,19 @@ def main():
         print("     (TensorRT-LLM / Triton). The fixture expects verify='skipped',")
         print("     which is the correct current behaviour. If a verify schema is")
         print("     added later, update CHECKS['triton'] expected_verify accordingly.")
-        print("  3. https-vllm: HTTPS fixture with self-signed cert is running and")
-        print("     serves valid vLLM routes, but srecon engine lacks TLS support.")
-        print("     _Conn.open() uses plain asyncio.open_connection (no ssl param),")
-        print("     and no --tls/--no-tls CLI flags exist. When the sibling TLS task")
-        print("     lands, this fixture should classify GENUINE/vllm with verify=live")
-        print("     and TLS flags (self_signed, cert_valid, etc.) populated.")
-        print("     Currently marked FIXME — not counted as a lab failure.")
+        print("  3. TLS fixtures (https-vllm, https-ollama, https-llamacpp, https-vllm-expired)")
+        print("     place real self-signed certs behind the lab's own 127.0.0.1 high ports.")
+        print("     None of them bind port 443, so the engine reaches them through its")
+        print("     TLS_FALLBACK path: plaintext connects succeed (TCP) but return zero")
+        print("     HTTP responses, then the engine retries over TLS. TLS_FALLBACK is")
+        print("     expected + asserted on every TLS fixture. The CERT VARIANT")
+        print("     https-vllm-expired serves an EXPIRED cert; because srecon probes with")
+        print("     verify_mode=CERT_NONE (TLS_VERIFY=False), the stale cert is accepted")
+        print("     mid-handshake and the server is still classified + verified — the tls")
+        print("     dict's not_after is simply in the past, which the lab asserts. This")
+        print("     pins the intended 'reach any TLS server even with a bad cert' behaviour.")
+        print("     None of this is a defect; the authwall/triton items above are the only")
+        print("     genuine spec deviations.")
 
         return 1 if failures else 0
     finally:

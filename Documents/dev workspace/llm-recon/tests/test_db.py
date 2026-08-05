@@ -193,6 +193,92 @@ class DropFieldPersistenceTest(DbTestCase):
         self.assertEqual(row, (sid, "qwen2.5:7b"))
 
 
+class FlagsMigrationTest(DbTestCase):
+    def test_v3_migration_adds_flags_column_and_preserves_rows(self):
+        # Build a v2 database by hand (migrations 1+2 only), insert a row,
+        # then let _init_db upgrade it to v3.
+        conn = sqlite3.connect(db.STATE_DB)
+        db._migration_1_base_schema(conn)
+        db._migration_2_scans_and_fields(conn)
+        conn.execute("PRAGMA user_version = 2")
+        conn.execute(
+            "INSERT INTO targets (ip,port,verdict,product,score,scanned_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("1.2.3.4", 8080, "GENUINE", "ollama", 12, time.time()))
+        conn.commit()
+        conn.close()
+        self.assertEqual(db.schema_version(), 2)
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            pre = conn.execute("PRAGMA table_info(targets)").fetchall()
+        finally:
+            conn.close()
+        self.assertNotIn("flags", {r[1] for r in pre})
+        # runtime upgrade v2 -> v3
+        db._init_db().close()
+        self.assertEqual(db.schema_version(), 3)
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(targets)")}
+            row = conn.execute(
+                "SELECT ip, port, verdict, product, score FROM targets "
+                "WHERE ip='1.2.3.4'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)  # preserved row count
+        self.assertIn("flags", cols)  # column added
+        self.assertEqual(row, ("1.2.3.4", 8080, "GENUINE", "ollama", 12))
+
+    def test_v3_migration_is_idempotent_and_noop_on_existing_rows(self):
+        db._init_db().close()  # fresh DB migrates straight to v3
+        self.assertEqual(db.schema_version(), 3)
+        db._init_db().close()
+        self.assertEqual(db.schema_version(), 3)
+
+
+class FlagsPersistenceTest(DbTestCase):
+    def test_store_scan_result_round_trips_flags_json(self):
+        db.store_scan_result({
+            "target": "1.2.3.4:11434", "verdict": "GENUINE",
+            "flags": ["IMPORTED_SHODAN", "CLOUD_ONLY"]})
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            flags = conn.execute(
+                "SELECT flags FROM targets WHERE ip='1.2.3.4'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(flags),
+                         ["IMPORTED_SHODAN", "CLOUD_ONLY"])
+
+    def test_store_scan_result_missing_flags_keeps_null(self):
+        db.store_scan_result({"target": "1.2.3.4:8080", "verdict": "DARK"})
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            flags = conn.execute(
+                "SELECT flags FROM targets WHERE ip='1.2.3.4'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsNone(flags)
+
+    def test_store_results_round_trips_flags(self):
+        db.store_results([
+            {"target": "1.2.3.4:8000", "verdict": "GENUINE",
+             "flags": ["IMPORTED_SHODAN"]},
+            {"target": "2.3.4.5:11434", "verdict": "UNKNOWN"},  # no flags
+        ])
+        conn = sqlite3.connect(db.STATE_DB)
+        try:
+            a = conn.execute(
+                "SELECT flags FROM targets WHERE ip='1.2.3.4'").fetchone()[0]
+            b = conn.execute(
+                "SELECT flags FROM targets WHERE ip='2.3.4.5'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(json.loads(a), ["IMPORTED_SHODAN"])
+        self.assertIsNone(b)
+
+
 class ScanHistoryTest(DbTestCase):
     def test_start_and_query_scan(self):
         sid = db.start_scan(target_count=10, params={"fleet": "llamacpp"})

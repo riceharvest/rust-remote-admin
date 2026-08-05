@@ -44,12 +44,14 @@ CSV_COLUMNS = [
     "latency_ms", "asn", "as_name", "bgp_prefix", "net_type", "ptr", "flags",
 ]
 
-# Rich dropped-field columns the targets table may carry (schema v2). Selected
-# dynamically in load_db_results so legacy v0 tables (no such columns) still
-# load — the fields are simply absent from those rows.
+# Rich dropped-field/persisted columns the targets table may carry (schema
+# v2+, plus the v3 flags column). Selected dynamically in load_db_results so
+# legacy v0 tables (no such columns) still load — the fields are simply
+# absent from those rows.
 _RICH_COLUMNS = [
     "model", "models_served", "version", "verify_result", "verify_detail",
     "latency_ms", "asn", "as_name", "bgp_prefix", "net_type", "error",
+    "flags",
 ]
 
 # Canonical JSON result fields, in display order, for render_json / diff rows.
@@ -155,6 +157,14 @@ def load_db_results(scan_id=None, db_path=None):
                     v = json.loads(v)
                 except (TypeError, ValueError):
                     v = v
+            elif c == "flags":
+                if v is None:
+                    v = []
+                elif not isinstance(v, (list, tuple)):
+                    try:
+                        v = json.loads(v)
+                    except (TypeError, ValueError):
+                        v = []
             r[c] = v
         results.append(r)
     meta = {"source": "sqlite history", "scan_id": scan_id}
@@ -166,10 +176,11 @@ def load_db_results(scan_id=None, db_path=None):
 # --------------------------------------------------------------------------
 
 def summarize(results):
-    """Aggregate verdict distribution, framework breakdown, top ASNs."""
+    """Aggregate verdict distribution, framework breakdown, top ASNs, flags."""
     verdicts = {v: 0 for v in VERDICTS}
     frameworks = {}
     asns = {}  # (asn, as_name) -> count
+    flags_counter = {}
     for r in results:
         v = (r.get("verdict") or "UNKNOWN").upper()
         if v not in verdicts:
@@ -181,11 +192,20 @@ def summarize(results):
         if a:
             name = (r.get("as_name") or "").strip() or "-"
             asns[(a, name)] = asns.get((a, name), 0) + 1
+        fs = r.get("flags")
+        if isinstance(fs, (list, tuple)):
+            for f in fs:
+                if f:
+                    flags_counter[str(f)] = flags_counter.get(str(f), 0) + 1
+        elif fs:
+            flags_counter[str(fs)] = flags_counter.get(str(fs), 0) + 1
     return {
         "total": len(results),
         "verdicts": verdicts,
         "frameworks": sorted(frameworks.items(), key=lambda kv: (-kv[1], kv[0])),
         "asns": sorted(asns.items(), key=lambda kv: (-kv[1], kv[0][0])),
+        "top_flags": sorted(flags_counter.items(),
+                            key=lambda kv: (-kv[1], kv[0])),
     }
 
 

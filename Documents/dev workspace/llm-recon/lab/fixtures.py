@@ -26,44 +26,79 @@ _LOCK = threading.Lock()
 # --- TLS cert handling (self-signed, generated at fixture start) ---
 _CERT_CACHE = None
 _CERT_CACHE_LOCK = threading.Lock()
+# separate cache for the intentionally-EXPIRED cert (https-vllm-expired)
+_CERT_CACHE_EXPIRED = None
+
+
+def _build_cert(cert_path, key_path, date_args):
+    """Run `openssl req -x509` to write a self-signed cert pair.
+
+    `date_args` selects the validity window: ['-days', '365'] for a normal
+    cert, or ['-not_before', ..., '-not_after', ...] (OpenSSL 3.x ASN1_UTCTIME
+    format) for the expired variant. Requires openssl in PATH.
+    """
+    cmd = [
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", key_path, "-out", cert_path,
+        "-nodes", "-subj", "/CN=127.0.0.1",
+    ] + list(date_args)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        # Clean up on failure
+        import shutil
+        shutil.rmtree(os.path.dirname(cert_path), ignore_errors=True)
+        raise RuntimeError(
+            "Failed to generate self-signed TLS cert. "
+            "Ensure 'openssl' is installed and in PATH. "
+            f"Original error: {e}"
+        )
+
 
 def _get_or_create_self_signed_cert():
     """Return (certfile, keyfile) paths for a self-signed certificate.
 
     Generates a new cert via `openssl` on first call (cached thereafter).
-    Requires `openssl` command in PATH — documented in lab/README.md.
+    Valid 365 days from now. Requires `openssl` command in PATH — documented
+    in lab/README.md.
     """
     global _CERT_CACHE
     with _CERT_CACHE_LOCK:
         if _CERT_CACHE is not None:
             return _CERT_CACHE
 
-        # Create a temp dir for the cert pair; it persists for the process lifetime.
         cert_dir = tempfile.mkdtemp(prefix="srecon_lab_cert_")
         cert_path = os.path.join(cert_dir, "cert.pem")
         key_path = os.path.join(cert_dir, "key.pem")
-
-        # Generate self-signed cert: CN=127.0.0.1, valid 365 days, no passphrase.
-        # 2048-bit RSA is fine for a local test fixture.
-        cmd = [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", key_path, "-out", cert_path,
-            "-days", "365", "-nodes", "-subj", "/CN=127.0.0.1",
-        ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            # Clean up on failure
-            import shutil
-            shutil.rmtree(cert_dir, ignore_errors=True)
-            raise RuntimeError(
-                "Failed to generate self-signed TLS cert. "
-                "Ensure 'openssl' is installed and in PATH. "
-                f"Original error: {e}"
-            )
-
+        _build_cert(cert_path, key_path, ["-days", "365"])
         _CERT_CACHE = (cert_path, key_path)
         return _CERT_CACHE
+
+
+def _get_or_create_expired_cert():
+    """Return (certfile, keyfile) paths for a cert that is ALREADY EXPIRED.
+
+    notBefore = 2019-01-01, notAfter = 2020-01-01 — years in the past. Used by
+    the https-vllm-expired CERT VARIANT fixture. Because srecon probes with
+    verify_mode=CERT_NONE (TLS_VERIFY=False), the engine accepts the stale peer
+    cert mid-handshake and classifies normally, but the captured tls dict
+    exposes not_after in the past. This is the "reach any TLS server even with
+    a bad/expired cert" behaviour the lab pins down.
+    """
+    global _CERT_CACHE_EXPIRED
+    with _CERT_CACHE_LOCK:
+        if _CERT_CACHE_EXPIRED is not None:
+            return _CERT_CACHE_EXPIRED
+
+        cert_dir = tempfile.mkdtemp(prefix="srecon_lab_cert_expired_")
+        cert_path = os.path.join(cert_dir, "cert.pem")
+        key_path = os.path.join(cert_dir, "key.pem")
+        _build_cert(cert_path, key_path, [
+            "-not_before", "20190101000000Z",
+            "-not_after", "20200101000000Z",
+        ])
+        _CERT_CACHE_EXPIRED = (cert_path, key_path)
+        return _CERT_CACHE_EXPIRED
 
 
 def log_request(name, method, path, status):
@@ -410,10 +445,26 @@ FIXTURE_SPECS = {
                                      b'{"error":"not found"}'), None),  # Server header in routes
     "triton":   (_triton_routes, (404, {"Content-Type": "application/json"},
                                    b'{"error":"not found"}'), "Server: triton/24.08"),
-    # TLS variant: same vLLM surface over HTTPS with self-signed cert
+    # TLS variants: same surfaces over HTTPS with self-signed certs.
+    # https-vllm / https-ollama / https-llamacpp reuse the plaintext route
+    # tables verbatim; https-vllm-expired is the CERT VARIANT — identical
+    # vLLM surface but serving an ALREADY-EXPIRED self-signed certificate.
     "https-vllm": (_vllm_routes, (404, {"Content-Type": "application/json"},
-                                    b'{"error":"not found"}'), "Server: vllm/0.6.6"),
+                                   b'{"error":"not found"}'), "Server: vllm/0.6.6"),
+    "https-ollama": (_ollama_routes, (404, {"Content-Type": "application/json"},
+                                      b'{"error":"not found"}'), None),
+    "https-llamacpp": (_llamacpp_routes, (404, {"Content-Type": "application/json"},
+                                          b'{"error":"not found"}'), None),
+    "https-vllm-expired": (_vllm_routes, (404, {"Content-Type": "application/json"},
+                                          b'{"error":"not found"}'), "Server: vllm/0.6.6"),
 }
+
+# fixtures served over TLS (HTTPSFixture). https-vllm-expired additionally
+# serves an expired certificate (see _get_or_create_expired_cert).
+HTTPS_NAMES = frozenset({
+    "https-vllm", "https-ollama", "https-llamacpp", "https-vllm-expired",
+})
+EXPIRED_CERT_NAMES = frozenset({"https-vllm-expired"})
 
 
 # ---------------------------------------------------------------------------
@@ -507,12 +558,21 @@ class HTTPSFixture:
     Serves the same routes as the HTTP variant but on a TLS-wrapped socket.
     Binds 127.0.0.1 only. Uses a high port (default 0 = ephemeral) since
     port 443 requires root.
+
+    `expired=True` swaps in an intentionally EXPIRED self-signed cert so the
+    CERT VARIANT fixture (https-vllm-expired) can pin the engine's
+    unverified-TLS behaviour: it must still classify the server and expose
+    the stale not_after in the tls dict.
     """
 
-    def __init__(self, name, routes_builder, default_route, banner, port=0):
+    def __init__(self, name, routes_builder, default_route, banner, port=0,
+                 expired=False):
         self.name = name
         self.routes = routes_builder()
-        cert_path, key_path = _get_or_create_self_signed_cert()
+        if expired:
+            cert_path, key_path = _get_or_create_expired_cert()
+        else:
+            cert_path, key_path = _get_or_create_self_signed_cert()
 
         # Create SSL context for server-side TLS
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -547,12 +607,15 @@ class HTTPSFixture:
 def start_all(port=0):
     """Start every fixture. Returns a list of Fixture, one per spec, in the
     canonical order (vllm, ollama, llamacpp, honeypot, authwall, gateway,
-    sglang, tgi, aphrodite, litellm, triton, https-vllm)."""
+    sglang, tgi, aphrodite, litellm, triton, then the TLS variants
+    https-vllm, https-ollama, https-llamacpp, https-vllm-expired)."""
     fixtures = []
     for name in FIXTURE_SPECS:
-        if name == "https-vllm":
+        if name in HTTPS_NAMES:
             routes_builder, default_route, banner = FIXTURE_SPECS[name]
-            fixtures.append(HTTPSFixture(name, routes_builder, default_route, banner, port=port))
+            fixtures.append(HTTPSFixture(
+                name, routes_builder, default_route, banner, port=port,
+                expired=(name in EXPIRED_CERT_NAMES)))
         else:
             fixtures.append(Fixture(name, port=port))
     return fixtures

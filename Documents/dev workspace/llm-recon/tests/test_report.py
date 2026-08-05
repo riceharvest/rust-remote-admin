@@ -251,6 +251,40 @@ class LoadDbResultsRichTest(ReportTestCase):
         self.assertEqual(r["latency_ms"], 42.5)
         self.assertEqual(meta["scan_id"], sid)
 
+    def test_db_flags_round_trip_and_legacy_null_loads_empty(self):
+        sid = self._seed_scan([
+            {"target": "1.1.1.1:8000", "verdict": "GENUINE", "product": "vllm",
+             "flags": ["IMPORTED_SHODAN", "CLOUD_ONLY"]},
+            {"target": "2.2.2.2:8000", "verdict": "UNKNOWN"},  # NULL flags
+        ])
+        results, _ = report.load_db_results(sid)
+        by_target = {r["target"]: r for r in results}
+        self.assertEqual(by_target["1.1.1.1:8000"]["flags"],
+                         ["IMPORTED_SHODAN", "CLOUD_ONLY"])
+        self.assertEqual(by_target["2.2.2.2:8000"]["flags"], [])
+
+    def test_db_backed_report_renders_flags_in_html(self):
+        sid = self._seed_scan([
+            {"target": "1.1.1.1:8000", "verdict": "GENUINE", "product": "vllm",
+             "flags": ["IMPORTED_SHODAN", "TLS_FALLBACK"]},
+        ])
+        results, meta = report.load_db_results(sid)
+        html = report.render_html(results, meta)
+        self.assertIn('class="tag"', html)
+        self.assertIn("IMPORTED_SHODAN", html)
+        self.assertIn("TLS_FALLBACK", html)
+
+    def test_summarize_aggregates_top_flags(self):
+        results = [
+            {"verdict": "GENUINE", "flags": ["IMPORTED_SHODAN", "CLOUD_ONLY"]},
+            {"verdict": "UNKNOWN", "flags": ["IMPORTED_SHODAN"]},
+            {"verdict": "DARK"},  # no flags
+            {"verdict": "GENUINE", "flags": ["TLS_FALLBACK"]},
+        ]
+        s = report.summarize(results)
+        self.assertEqual(s["top_flags"], [
+            ("IMPORTED_SHODAN", 2), ("CLOUD_ONLY", 1), ("TLS_FALLBACK", 1)])
+
 
 if __name__ == "__main__":
     unittest.main()
