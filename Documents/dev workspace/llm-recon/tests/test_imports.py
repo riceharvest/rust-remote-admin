@@ -137,6 +137,39 @@ class CensysJsonImportTest(ImportsTestCase):
         self.assertEqual(errors, 0)
         self.assertEqual(results[0]["product"], "litellm")
 
+    def test_top_level_array_with_host_level_ip(self):
+        # Real Censys host exports: address lives on the HOST, services
+        # carry only port + banner. Regression: parent ip must be injected.
+        arr = [{"ip": "1.2.3.4", "services": [
+            {"port": 8000, "service_name": "http",
+             "http": {"response": {"body": "SGLang server ready"}}}]},
+            {"ip": "5.6.7.8", "services": [
+                {"port": 11434, "service_name": "http",
+                 "http": {"response": {"body": "ollama is running"}}}]}]
+        p = self._write("hosts.json", json.dumps(arr))
+        results, errors = imports.import_censys_json(p)
+        self.assertEqual(errors, 0)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["target"], "1.2.3.4:8000")
+        self.assertEqual(results[0]["product"], "sglang")
+        self.assertEqual(results[1]["target"], "5.6.7.8:11434")
+        self.assertEqual(results[1]["product"], "ollama")
+
+    def test_array_export_not_misdetected_as_csv(self):
+        # Regression: _looks_csv must reject JSON arrays starting with "["
+        # (a JSON array line contains commas, so the old comma-sniff
+        # misclassified it as CSV and imported 0 rows).
+        arr = [{"ip": "1.2.3.4", "services": [
+            {"port": 8000, "service_name": "http",
+             "http": {"response": {"body": "vLLM server"}}}]}]
+        p = self._write("hosts.json", json.dumps(arr))
+        self.assertFalse(imports._looks_csv(p))
+        fmt = imports.detect_format(p, "censys")
+        self.assertEqual(fmt, "censys")
+        results, errors = imports.import_censys(p)
+        self.assertEqual(errors, 0)
+        self.assertEqual(len(results), 1)
+
 
 class CensysCsvImportTest(ImportsTestCase):
     def test_parses_csv_rows(self):

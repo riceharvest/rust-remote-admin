@@ -190,23 +190,53 @@ def _map_censys_service(service, asn=None, as_name=None):
 
 
 def _iter_censys_json(path):
-    """Yield Censys ``services`` entries from a JSON object or JSON-lines."""
+    """Yield Censys ``services`` entries from a JSON object or JSON-lines.
+
+    Censys host exports carry the address at the HOST level
+    (``{"ip": ..., "services": [...]}``) while each service entry only has
+    ``port`` + banner evidence — so the parent ``ip`` is injected into each
+    yielded service (services missing a port are skipped).
+    """
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            services = obj.get("services")
-            if isinstance(services, list):
-                for svc in services:
-                    yield svc
-            elif isinstance(obj, dict) and "ip" in obj and "port" in obj:
-                # a single service object on one line (Censys modern JSON-lines)
-                yield obj
+        # Handle a top-level JSON array export (list of host objects) too:
+        # consume the whole file first so json.load can see the array.
+        text = fh.read()
+
+    def _host_services(obj):
+        if not isinstance(obj, dict):
+            return
+        services = obj.get("services")
+        host_ip = obj.get("ip")
+        if isinstance(services, list):
+            for svc in services:
+                if not isinstance(svc, dict):
+                    continue
+                if "ip" not in svc and host_ip:
+                    svc = dict(svc)
+                    svc["ip"] = host_ip
+                if svc.get("port") is None:
+                    continue
+                yield svc
+        elif isinstance(obj, dict) and "ip" in obj and "port" in obj:
+            yield obj
+
+    if text.lstrip().startswith("["):
+        try:
+            arr = json.loads(text)
+        except (ValueError, TypeError):
+            arr = []
+        for obj in arr:
+            yield from _host_services(obj)
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        yield from _host_services(obj)
 
 
 def import_censys_json(path):
@@ -264,11 +294,14 @@ def _looks_csv(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         return True
-    # header sniff fallback — only meaningful for a real CSV, never JSON
+    # header sniff fallback — only meaningful for a real CSV, never JSON.
+    # Note: Censys JSON exports can be an ARRAY starting with "[" or a bare
+    # object starting with "{"; both must be rejected as CSV.
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             head = fh.readline(4096).strip()
-        if not head or head.startswith("{") or "," not in head:
+        if (not head or head.startswith("{") or head.startswith("[")
+                or "," not in head):
             return False
         return "ip" in head and "port" in head
     except OSError:
