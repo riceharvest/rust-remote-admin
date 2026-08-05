@@ -13,6 +13,7 @@ Usage:
     python3 -m srecon cidrs --cc DE
     python3 -m srecon packs
     python3 -m srecon frameworks
+    python3 -m srecon publish [--out-dir site/data] [--min-bucket 5] [--lag-days 0]
     python3 -m srecon serve --port 7777
 
 All output is machine-parseable JSON/NDJSON by default.
@@ -306,6 +307,7 @@ def cmd_scan(args):
         shodan_seed=args.shodan_seed,
         sweep_all_ports=args.sweep_all_ports,
         verify=args.verify,
+        tls=args.tls,
     ):
         etype = ev["type"]
         if etype == "start":
@@ -413,6 +415,39 @@ def cmd_scan(args):
                   f"{r.get('score',0):>5} {r.get('latency_ms','?'):>5}")
 
 
+def cmd_publish(args):
+    """Write k-anonymized aggregate JSON files for the public census site feed."""
+    import os
+    from .publish import export_aggregates, OUT_FILES
+
+    if args.dry_run:
+        # resolve the would-be output paths without touching the DB or disk
+        out_dir = args.out_dir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "site", "data")
+        for name in OUT_FILES:
+            print(os.path.join(out_dir, name))
+        print(f"[publish] dry-run: {len(OUT_FILES)} file(s) would be written "
+              f"to {out_dir} (min_bucket={args.min_bucket}, lag_days={args.lag_days})")
+        return
+
+    try:
+        manifest = export_aggregates(
+            db_path=args.db, min_bucket=args.min_bucket,
+            lag_days=args.lag_days, out_dir=args.out_dir)
+    except FileNotFoundError as e:
+        _eprint(f"error: {e}")
+        sys.exit(1)
+
+    for path in manifest["files"]:
+        print(path)
+    b = manifest["buckets"]
+    print(f"[publish] {len(manifest['files'])} file(s) written to "
+          f"{manifest['out_dir']} — targets={b['targets']} live={b['live']} "
+          f"asn_buckets={b['asn_buckets']} other_merged={b['asn_other_merged']} "
+          f"(min_bucket={manifest['min_bucket']}, lag_days={manifest['lag_days']})")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="srecon",
@@ -453,6 +488,8 @@ def main():
     fw.add_argument("--ct-seed", action="store_true", help="Seed via Certificate Transparency")
     fw.add_argument("--shodan-seed", action="store_true", help="Seed via Shodan")
     fw.add_argument("--verify", action="store_true", help="Deep verify: POST a tiny generate request to confirm real inference (not stub/auth)")
+    fw.add_argument("--no-tls", dest="tls", action="store_false", default=True,
+                    help="Disable TLS probing (port 443 + TLS fallback for nginx-fronted HTTPS)")
 
     out = p_scan.add_argument_group("output")
     out.add_argument("--json", dest="ndjson", action="store_true", help="Stream results as NDJSON (machine-readable)")
@@ -536,6 +573,24 @@ def main():
     p_imp.add_argument("--dry-run", action="store_true",
                        help="Parse + map only; do not touch the database")
     p_imp.set_defaults(func=cmd_import)
+
+    # --- publish ---
+    p_pub = sub.add_parser(
+        "publish",
+        help="Write k-anonymized aggregate JSON files for the public census site feed")
+    p_pub.add_argument("--out-dir", default=None, metavar="DIR",
+                       help="Output directory (default: site/data/)")
+    p_pub.add_argument("--min-bucket", type=int, default=5, metavar="N",
+                       help="Minimum count for a published bucket; smaller "
+                            "buckets are suppressed/merged (default: 5)")
+    p_pub.add_argument("--lag-days", type=int, default=0, metavar="N",
+                       help="Exclude rows scanned within the last N days "
+                            "(default: 0 = no lag)")
+    p_pub.add_argument("--db", default=None, metavar="PATH",
+                       help="History DB path (default: srecon/data/state.db)")
+    p_pub.add_argument("--dry-run", action="store_true",
+                       help="Print would-write paths without writing anything")
+    p_pub.set_defaults(func=cmd_publish)
 
     args = ap.parse_args()
     if not args.command:

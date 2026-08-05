@@ -89,7 +89,7 @@ class FrameworkRegistryTest(unittest.TestCase):
         from collections import Counter
         counts = Counter(p for fw in config.FRAMEWORKS.values() for p in fw["ports"])
         shared = {p for p, n in counts.items() if n > 1}
-        self.assertEqual(shared, {3000, 5000, 8000, 8080},
+        self.assertEqual(shared, {3000, 443, 5000, 8000, 8080},
                          f"unexpected cross-framework port collision: {shared}")
 
     def test_no_framework_port_list_is_empty_or_falsy(self):

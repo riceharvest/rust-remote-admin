@@ -21,14 +21,14 @@ PROBE_PATHS = [
 ]
 # per-framework probe paths and default ports (union is used when several are selected)
 FRAMEWORKS = {
-    "vllm": {"paths": ["/", "/version", "/v1/models"], "ports": [8000, 8001]},
-    "llamacpp": {"paths": ["/", "/props", "/health", "/v1/models"], "ports": [8080]},
-    "sglang": {"paths": ["/", "/get_model_info", "/get_server_info", "/v1/models"], "ports": [30000]},
-    "ollama": {"paths": ["/", "/api/tags", "/api/version", "/v1/models"], "ports": [11434]},
+    "vllm": {"paths": ["/", "/version", "/v1/models"], "ports": [8000, 8001, 443]},
+    "llamacpp": {"paths": ["/", "/props", "/health", "/v1/models"], "ports": [8080, 443]},
+    "sglang": {"paths": ["/", "/get_model_info", "/get_server_info", "/v1/models"], "ports": [30000, 443]},
+    "ollama": {"paths": ["/", "/api/tags", "/api/version", "/v1/models"], "ports": [11434, 443]},
     "lmstudio": {"paths": ["/", "/api/v0/models", "/v1/models"], "ports": [1234]},
     "koboldcpp": {"paths": ["/", "/api/extra/version", "/api/v1/model"], "ports": [5001]},
     "tgwui": {"paths": ["/", "/api/v1/model", "/run/predict", "/v1/models"], "ports": [5000, 7860]},
-    "tgi": {"paths": ["/", "/info", "/v1/internal/model/info"], "ports": [80, 3000]},
+    "tgi": {"paths": ["/", "/info", "/v1/internal/model/info"], "ports": [80, 3000, 443]},
     "openwebui": {"paths": ["/", "/api/version", "/api/config"], "ports": [3000]},
     "aphrodite": {"paths": ["/", "/version", "/v1/models"], "ports": [2242]},
     "triton": {"paths": ["/", "/v2/health/ready", "/v2/models"], "ports": [8000]},
@@ -131,5 +131,10 @@ DEFAULT_DOD_EXCLUDES = [
     "26.0.0.0/8", "28.0.0.0/8", "29.0.0.0/8", "30.0.0.0/8", "33.0.0.0/8",
     "55.0.0.0/8", "56.0.0.0/8", "214.0.0.0/8", "215.0.0.0/8",
 ]
+# TLS/HTTPS configuration
+HTTPS_ENABLED = True  # allow TLS probing (--no-tls disables)
+TLS_VERIFY = False    # verify server certs (False = unverified, like browsers in dev)
+TLS_FALLBACK = True   # retry plaintext failures over TLS (nginx-fronted HTTPS on 8000, etc.)
+
 # Lean port set: the ports where real deployments dominate.
-LEAN_PORTS = {8080, 11434, 8000, 4000}   # 4000 = LiteLLM, a very common gateway
+LEAN_PORTS = {8080, 11434, 8000, 4000, 443}  # 4000 = LiteLLM, 443 = HTTPS standard

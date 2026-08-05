@@ -4,6 +4,7 @@ import http.client
 import json
 import re
 import socket
+import ssl
 import time
 
 from .config import (
@@ -11,6 +12,7 @@ from .config import (
     SCORE_WEIGHTS, LEGIT_COMBOS, FRONTENDS, SIG_PRIORITY, PROXY_SIGS,
     REAL_LLAMACPP_MARKERS, PROPRIETARY_VENDORS,
     CLOUD_SUFFIX, VERIFY_TIMEOUT, VERIFY_PROMPT, VERIFY_MAX_TOKENS,
+    HTTPS_ENABLED, TLS_VERIFY,
 )
 
 # frameworks whose OpenAI-compatible surface verifies via POST /v1/completions
@@ -23,9 +25,28 @@ OPENAI_COMPAT_VERIFY = frozenset({
 _VLLM_VERSION_RE = re.compile(r"^v?\d+\.\d+\.\d+(\.post\d+)?$")
 
 
-def classify(host, port, probe_cb=None, timeout=PROBE_TIMEOUT, paths=None):
+def _ssl_ctx():
+    """Unverified client SSLContext for TLS probing (or verified when TLS_VERIFY)."""
+    ctx = ssl.create_default_context()
+    if not TLS_VERIFY:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _conn_for(host, port, timeout, tls=False):
+    """http.client connection; HTTPS when tls so verify/classify hit https://."""
+    if tls and HTTPS_ENABLED:
+        return http.client.HTTPSConnection(host, port, timeout=timeout,
+                                           context=_ssl_ctx())
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def classify(host, port, probe_cb=None, timeout=PROBE_TIMEOUT, paths=None,
+             tls=False):
     """Probe one host:port. Returns a dossier dict.
-    probe_cb(host, port, path, status, err) fires after every request."""
+    probe_cb(host, port, path, status, err) fires after every request.
+    tls=True probes over HTTPS (unverified) instead of plaintext HTTP."""
     paths = paths or PROBE_PATHS
     dossier = {
         "target": f"{host}:{port}",
@@ -67,7 +88,7 @@ def classify(host, port, probe_cb=None, timeout=PROBE_TIMEOUT, paths=None):
         for _attempt in range(2):  # retry once on a dropped keep-alive
             try:
                 if conn is None:
-                    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+                    conn = _conn_for(host, port, timeout, tls=tls)
                 conn.request("GET", path, headers={"User-Agent": "silicon-recon/1.0"})
                 resp = conn.getresponse()
                 body = resp.read(65536).decode("utf-8", errors="replace")
@@ -480,8 +501,8 @@ def detect_sigs(ep):
     return sigs
 
 
-def _fetch_json(host, port, path, timeout):
-    c = http.client.HTTPConnection(host, port, timeout=min(timeout, 5))
+def _fetch_json(host, port, path, timeout, tls=False):
+    c = _conn_for(host, port, min(timeout, 5), tls=tls)
     c.request("GET", path)
     r = c.getresponse()
     body = r.read(65536).decode("utf-8", "replace")
@@ -556,14 +577,15 @@ def _verify_response(schema, d):
     return "", False
 
 
-def verify_inference(host, port, sigs=None, timeout=VERIFY_TIMEOUT):
+def verify_inference(host, port, sigs=None, timeout=VERIFY_TIMEOUT, tls=False):
     """POST a tiny generate request to confirm real inference (not a stub).
     Returns (verdict, detail) where verdict is one of:
       live / auth-walled / honeypot / timeout / error / skipped
     Dispatch is framework-aware: the request schema matches the detected
     product (ollama /api/generate, llamacpp /completion, tgi /generate,
     OpenAI-compat family /v1/completions). Unknown products are skipped.
-    The smallest advertised model is used to minimise cold-start cost."""
+    The smallest advertised model is used to minimise cold-start cost.
+    tls=True POSTs over HTTPS (unverified) — required for TLS-fronted targets."""
     sigs = sigs or {}
     schema = _verify_schema(sigs)
     if schema is None:
@@ -574,7 +596,7 @@ def verify_inference(host, port, sigs=None, timeout=VERIFY_TIMEOUT):
     model = None
     try:
         if schema == "ollama":
-            tags = _fetch_json(host, port, "/api/tags", timeout)
+            tags = _fetch_json(host, port, "/api/tags", timeout, tls=tls)
             names = [m.get("name", "?") for m in tags.get("models", [])
                      if isinstance(m, dict)]
             # prefer a local model over a :cloud one — cloud just returns auth error
@@ -583,13 +605,13 @@ def verify_inference(host, port, sigs=None, timeout=VERIFY_TIMEOUT):
             if pool:
                 model = min(pool, key=len)
         elif schema in ("openai", "llamacpp"):
-            v1 = _fetch_json(host, port, "/v1/models", timeout)
+            v1 = _fetch_json(host, port, "/v1/models", timeout, tls=tls)
             ids = [m.get("id") for m in v1.get("data", [])
                    if isinstance(m, dict) and m.get("id")]
             if ids:
                 model = min((str(i) for i in ids), key=len)
         elif schema == "tgi":
-            info = _fetch_json(host, port, "/info", timeout)
+            info = _fetch_json(host, port, "/info", timeout, tls=tls)
             mid = info.get("model_id") if isinstance(info, dict) else None
             model = str(mid) if mid else None
     except Exception:
@@ -599,7 +621,7 @@ def verify_inference(host, port, sigs=None, timeout=VERIFY_TIMEOUT):
 
     payload, post_path = _verify_request(schema, model)
     try:
-        c = http.client.HTTPConnection(host, port, timeout=timeout)
+        c = _conn_for(host, port, timeout, tls=tls)
         c.request("POST", post_path, body=payload,
                   headers={"Content-Type": "application/json"})
         r = c.getresponse()

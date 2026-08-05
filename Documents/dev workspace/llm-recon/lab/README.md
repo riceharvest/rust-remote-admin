@@ -29,6 +29,7 @@ Zero packets leave the machine:
 | `aphrodite` | Aphrodite Engine root JSON `app_name`, `/version`, `/v1/models` | `GENUINE` / `aphrodite` | `live` |
 | `litellm` | LiteLLM proxy: `/health/liveliness`=LIVE, `/models`, `/v1/models` mixed owned_by (openai+anthropic), `Server: litellm` | `GENUINE` / `litellm` — **NOT IMPOSTOR** (PROXY_INVENTORY suppresses) | `live` |
 | `triton` | Triton / TensorRT-LLM: `/v2/health/ready` 200, `/v2/models`, **no `/v1` paths** | `GENUINE` / `triton` | `skipped`† |
+| `https-vllm` | vLLM over **HTTPS (TLS)** with self-signed cert: same `/version`, `/v1/models`, `/v1/completions` on 127.0.0.1 high port | `GENUINE` / `vllm` ‡ | `live` ‡ |
 
 * **Spec note:** the parent spec asked for `verify=auth-walled` on the authwall
 fixture. Current srecon cannot produce that for an all-401 server: status-200
@@ -42,6 +43,17 @@ printed by `run_lab.py`.
 (currently only ollama, llamacpp, tgi, and OpenAI-compat families have one).
 The fixture correctly expects `verify='skipped'`. If a verify schema is added
 later, update `CHECKS['triton']` in `run_lab.py`.
+
+‡ **FIXME:** `https-vllm` is a TLS fixture that serves valid vLLM routes over
+HTTPS with a self-signed certificate. However, the srecon engine currently
+**lacks TLS support**: `_Conn.open()` uses plain `asyncio.open_connection` with
+no `ssl` parameter, and no `--tls`/`--no-tls` CLI flags exist. The fixture runs
+and is reachable (testable with `curl -k` or Python `ssl`), but the scan will
+yield `ERROR` or `DARK`. This is marked `FIXME` in `run_lab.py` and is **not
+counted as a lab failure**. When the sibling TLS task lands (engine `_Conn ssl`
+param + `--tls` flag), this fixture should classify `GENUINE`/`vllm` with
+`verify=live` and TLS metadata flags (`self_signed`, `cert_valid`, etc.)
+populated.
 
 The harness additionally checks the **db → report round-trip**: after the scan,
 it runs `srecon report --format md` and asserts every fixture's target and
@@ -75,7 +87,7 @@ manually if ever needed.
 
 ## Fixtures
 
-`lab/fixtures.py` defines eleven fixtures. Each is a `ThreadingHTTPServer` bound to
+`lab/fixtures.py` defines twelve fixtures. Each is a `ThreadingHTTPServer` bound to
 `127.0.0.1:0` (ephemeral port). Every request is logged to the shared
 `REQUEST_LOG` as `(fixture_name, method, path, status)`.
 
@@ -99,6 +111,59 @@ helper; `_read_model()` echoes the `model` field from POST bodies.
 | `aphrodite` | `/` (app_name), `/version`, `/v1/models`, `/v1/completions` | — | openai |
 | `litellm` | `/health/liveliness`, `/models`, `/v1/models`, `/v1/completions` | `litellm` | openai |
 | `triton` | `/v2/health/ready`, `/v2/models` (no `/v1/*`) | `triton/24.08` | skipped |
+| `https-vllm` | `/version`, `/v1/models`, `/v1/completions` over **TLS** | `vllm/0.6.6` | openai (FIXME) |
+
+### HTTPS fixture + self-signed cert handling
+
+`https-vllm` is an **HTTPS variant of the vLLM fixture**: the exact same route
+table, served over TLS on `127.0.0.1`. It is implemented by `HTTPSFixture` in
+`lab/fixtures.py`, which:
+
+1. generates a **self-signed certificate at fixture start** via the `openssl`
+   command (`openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj
+   /CN=127.0.0.1`) into a temp dir;
+2. builds an `ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)` and calls
+   `ctx.load_cert_chain(certfile, keyfile)`;
+3. wraps the `ThreadingHTTPServer` socket with `ctx.wrap_socket(server_side=True)`
+   before `serve_forever()`.
+
+The cert pair is cached process-wide (`_CERT_CACHE`) so every HTTPS fixture
+reuses one cert. Port 443 cannot be bound unprivileged, so the fixture binds a
+high ephemeral port and the scan target is set explicitly as
+`127.0.0.1:<port>` — this is the target form that will exercise the engine's
+TLS path (port-443-or-fallback) via the explicit target once TLS lands.
+
+**openssl dependency:** the lab now needs `openssl` in `PATH` (it is not
+stdlib). All other lab behaviour remains stdlib-only. If `openssl` is missing,
+`start_all()` raises a clear `RuntimeError` — install it with your system
+package manager (`dnf install openssl`, `apt install openssl`, `brew install
+openssl`, ...).
+
+Manual smoke-test of the TLS fixture (self-signed ⇒ skip verification):
+
+```bash
+python3 - <<'EOF'
+import sys, ssl, urllib.request
+sys.path.insert(0, "lab")
+from fixtures import start_all, stop_all
+fx = start_all()
+try:
+    f = [x for x in fx if x.name == "https-vllm"][0]
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    print(urllib.request.urlopen(f"https://{f.target}/version", context=ctx).read())
+finally:
+    stop_all(fx)
+EOF
+```
+
+**Current status (FIXME):** the srecon engine has no TLS support yet
+(`_Conn.open()` uses plain `asyncio.open_connection`; no `--tls`/`--no-tls`
+flags), so the scan currently classifies this fixture `ERROR`/`DARK`. The
+assertion in `run_lab.py` is marked `FIXME` and does not fail the lab. The
+moment the sibling TLS work lands, flip `CHECKS["https-vllm"]` to a real
+assertion (`GENUINE` / `vllm` / `verify=live`, TLS flags present).
 
 ## How to add a fixture
 

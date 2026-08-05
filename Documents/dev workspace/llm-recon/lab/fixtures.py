@@ -12,12 +12,58 @@ no fixture makes outbound connections.
 """
 
 import json
+import os
+import ssl
+import subprocess
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --- shared request log (fixture_name, method, path, status) ---
 REQUEST_LOG = []
 _LOCK = threading.Lock()
+
+# --- TLS cert handling (self-signed, generated at fixture start) ---
+_CERT_CACHE = None
+_CERT_CACHE_LOCK = threading.Lock()
+
+def _get_or_create_self_signed_cert():
+    """Return (certfile, keyfile) paths for a self-signed certificate.
+
+    Generates a new cert via `openssl` on first call (cached thereafter).
+    Requires `openssl` command in PATH — documented in lab/README.md.
+    """
+    global _CERT_CACHE
+    with _CERT_CACHE_LOCK:
+        if _CERT_CACHE is not None:
+            return _CERT_CACHE
+
+        # Create a temp dir for the cert pair; it persists for the process lifetime.
+        cert_dir = tempfile.mkdtemp(prefix="srecon_lab_cert_")
+        cert_path = os.path.join(cert_dir, "cert.pem")
+        key_path = os.path.join(cert_dir, "key.pem")
+
+        # Generate self-signed cert: CN=127.0.0.1, valid 365 days, no passphrase.
+        # 2048-bit RSA is fine for a local test fixture.
+        cmd = [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path, "-out", cert_path,
+            "-days", "365", "-nodes", "-subj", "/CN=127.0.0.1",
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            # Clean up on failure
+            import shutil
+            shutil.rmtree(cert_dir, ignore_errors=True)
+            raise RuntimeError(
+                "Failed to generate self-signed TLS cert. "
+                "Ensure 'openssl' is installed and in PATH. "
+                f"Original error: {e}"
+            )
+
+        _CERT_CACHE = (cert_path, key_path)
+        return _CERT_CACHE
 
 
 def log_request(name, method, path, status):
@@ -364,6 +410,9 @@ FIXTURE_SPECS = {
                                      b'{"error":"not found"}'), None),  # Server header in routes
     "triton":   (_triton_routes, (404, {"Content-Type": "application/json"},
                                    b'{"error":"not found"}'), "Server: triton/24.08"),
+    # TLS variant: same vLLM surface over HTTPS with self-signed cert
+    "https-vllm": (_vllm_routes, (404, {"Content-Type": "application/json"},
+                                    b'{"error":"not found"}'), "Server: vllm/0.6.6"),
 }
 
 
@@ -452,11 +501,61 @@ class Fixture:
         return f"<Fixture {self.name} {self.target}>"
 
 
+class HTTPSFixture:
+    """A running fake LLM server over HTTPS (TLS with self-signed cert).
+
+    Serves the same routes as the HTTP variant but on a TLS-wrapped socket.
+    Binds 127.0.0.1 only. Uses a high port (default 0 = ephemeral) since
+    port 443 requires root.
+    """
+
+    def __init__(self, name, routes_builder, default_route, banner, port=0):
+        self.name = name
+        self.routes = routes_builder()
+        cert_path, key_path = _get_or_create_self_signed_cert()
+
+        # Create SSL context for server-side TLS
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+        # Create the server socket, then wrap it with SSL
+        self.server = _LabServer(("127.0.0.1", port), _Handler)
+        self.server.fixture_name = name
+        self.server.routes = self.routes
+        self.server.default_route = default_route
+        self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        self.target = f"127.0.0.1:{self.port}"
+        self._thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        try:
+            self.server.shutdown()
+        except Exception:
+            pass
+        try:
+            self.server.server_close()
+        except Exception:
+            pass
+
+    def __repr__(self):
+        return f"<HTTPSFixture {self.name} {self.target}>"
+
+
 def start_all(port=0):
     """Start every fixture. Returns a list of Fixture, one per spec, in the
     canonical order (vllm, ollama, llamacpp, honeypot, authwall, gateway,
-    sglang, tgi, aphrodite, litellm, triton)."""
-    return [Fixture(name, port=port) for name in FIXTURE_SPECS]
+    sglang, tgi, aphrodite, litellm, triton, https-vllm)."""
+    fixtures = []
+    for name in FIXTURE_SPECS:
+        if name == "https-vllm":
+            routes_builder, default_route, banner = FIXTURE_SPECS[name]
+            fixtures.append(HTTPSFixture(name, routes_builder, default_route, banner, port=port))
+        else:
+            fixtures.append(Fixture(name, port=port))
+    return fixtures
 
 
 def stop_all(fixtures):

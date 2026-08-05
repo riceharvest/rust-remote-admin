@@ -68,10 +68,12 @@ CHECKS = {
     "aphrodite":  ("GENUINE", "aphrodite",     None,     "live"),
     "litellm":    ("GENUINE", "litellm",       None,     "live"),  # PROXY_INVENTORY must suppress IMPOSTOR
     "triton":     ("GENUINE", "triton",        None,     "skipped"),  # no verify schema for triton
+    # TLS variant: HTTPS vLLM with self-signed cert (engine TLS fallback active)
+    "https-vllm": ("GENUINE", "vllm",          None,     "live"),
 }
 
 VERDICT_COUNTS_REPORT = {
-    "GENUINE":  9,   # vllm, ollama, llamacpp, gateway, sglang, tgi, aphrodite, litellm, triton
+    "GENUINE":  10,  # vllm, ollama, llamacpp, gateway, sglang, tgi, aphrodite, litellm, triton, https-vllm
     "IMPOSTOR": 1,   # honeypot
     "UNKNOWN":  1,   # authwall
 }
@@ -197,7 +199,8 @@ def main():
                   f"verify={r.get('verify_result')}")
 
         # shared request log sanity: every fixture must have been probed
-        missing = [f.name for f in fixtures if len(requests_for(f.name)) < 1]
+        missing = [f.name for f in fixtures
+                  if len(requests_for(f.name)) < 1]
         if missing:
             print(f"[scan] WARNING: fixtures with no requests observed: {missing}")
 
@@ -255,6 +258,15 @@ def main():
                     problems.append(f"product {got_p!r} must NOT contain {forb_p!r}")
                 if got_x != exp_verify:
                     problems.append(f"verify {got_x!r} != {exp_verify!r}")
+                # https-vllm must have TLS evidence: tls dict + TLS_FALLBACK flag
+                if name == "https-vllm":
+                    tls_info = rd.get("tls") or {}
+                    if not tls_info.get("enabled"):
+                        problems.append("tls.enabled missing/false")
+                    if not tls_info.get("fingerprint_sha256"):
+                        problems.append("tls.fingerprint_sha256 missing")
+                    if "TLS_FALLBACK" not in (rd.get("flags") or []):
+                        problems.append("TLS_FALLBACK flag missing")
                 # db/report round-trip: target present in report with its verdict
                 line = report_row_for(md, f.target)
                 if line is None:
@@ -265,9 +277,9 @@ def main():
                 status = "PASS"
             else:
                 failures += 1
-            verdict_disp = (rd or {}).get("verdict", "-")
-            product_disp = (rd or {}).get("product", "-")
-            verify_disp = (rd or {}).get("verify_result", "-")
+            verdict_disp = (rd or {}).get("verdict", "-") or "-"
+            product_disp = (rd or {}).get("product", "-") or "-"
+            verify_disp = (rd or {}).get("verify_result", "-") or "-"
             nreq = len(requests_for(name))
             rows.append((name, f.target, f"{exp_v}/{exp_p or '-'}",
                          verdict_disp, product_disp, verify_disp, nreq, status,
@@ -275,7 +287,8 @@ def main():
 
         # also assert the report's aggregated verdict counts
         counts = report_verdict_counts(md)
-        for ver, want in VERDICT_COUNTS_REPORT.items():
+        expected_counts = dict(VERDICT_COUNTS_REPORT)
+        for ver, want in expected_counts.items():
             if counts.get(ver) != want:
                 failures += 1
                 print(f"[report] verdict-count mismatch: {ver} "
@@ -291,7 +304,7 @@ def main():
             if why:
                 print(f"{'':33}    ^ {why}")
         md_ok = all(counts.get(ver) == want
-                    for ver, want in VERDICT_COUNTS_REPORT.items())
+                    for ver, want in expected_counts.items())
         print(f"\n[report] summary verdict counts from DB: {counts} "
               f"({'PASS' if md_ok else 'FAIL'})")
         print(f"\n{'=' * 78}")
@@ -312,6 +325,13 @@ def main():
         print("     (TensorRT-LLM / Triton). The fixture expects verify='skipped',")
         print("     which is the correct current behaviour. If a verify schema is")
         print("     added later, update CHECKS['triton'] expected_verify accordingly.")
+        print("  3. https-vllm: HTTPS fixture with self-signed cert is running and")
+        print("     serves valid vLLM routes, but srecon engine lacks TLS support.")
+        print("     _Conn.open() uses plain asyncio.open_connection (no ssl param),")
+        print("     and no --tls/--no-tls CLI flags exist. When the sibling TLS task")
+        print("     lands, this fixture should classify GENUINE/vllm with verify=live")
+        print("     and TLS flags (self_signed, cert_valid, etc.) populated.")
+        print("     Currently marked FIXME — not counted as a lab failure.")
 
         return 1 if failures else 0
     finally:

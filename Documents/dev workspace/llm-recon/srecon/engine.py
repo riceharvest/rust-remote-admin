@@ -6,6 +6,7 @@ import json
 import queue
 import random
 import resource
+import ssl
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ import time
 from .config import (
     PROBE_TIMEOUT, CONNECT_TIMEOUT, FRAMEWORKS, PROBE_PATHS,
     DEFAULT_PORTS, DEFAULT_DOD_EXCLUDES,
+    HTTPS_ENABLED, TLS_VERIFY, TLS_FALLBACK,
 )
 from .db import (
     load_blocklist, add_blocklist, store_scan_result,
@@ -129,14 +131,194 @@ def fd_worker_cap():
         return 256
 
 
+# ---------- TLS / certificate helpers ----------
+
+def _make_tls_ctx():
+    """Unverified client SSLContext for probing (or verified when TLS_VERIFY)."""
+    ctx = ssl.create_default_context()
+    if not TLS_VERIFY:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# minimal X.509 DER parsing (stdlib only) — enough to pull issuer/subject
+# and validity out of a peer certificate's DER bytes
+_OID_NAMES = {
+    "2.5.4.3": "CN", "2.5.4.6": "C", "2.5.4.7": "L", "2.5.4.8": "ST",
+    "2.5.4.10": "O", "2.5.4.11": "OU",
+    "1.2.840.113549.1.9.1": "emailAddress",
+}
+
+
+def _der_len(data, i):
+    b = data[i]
+    i += 1
+    if b < 0x80:
+        return b, i
+    n = b & 0x7F
+    return int.from_bytes(data[i:i + n], "big"), i + n
+
+
+def _read_tlv(data, i):
+    tag = data[i]
+    i += 1
+    ln, i = _der_len(data, i)
+    return tag, i, i + ln
+
+
+def _oid_to_str(b):
+    if not b:
+        return ""
+    n0 = b[0]
+    first = min(n0 // 40, 2)
+    second = n0 - first * 40
+    out = [first, second]
+    cur = 0
+    for byte in b[1:]:
+        cur = (cur << 7) | (byte & 0x7F)
+        if not (byte & 0x80):
+            out.append(cur)
+            cur = 0
+    if cur:
+        out.append(cur)
+    return ".".join(str(x) for x in out)
+
+
+def _parse_der_string(tag, val):
+    # 0x17 = UTCTime, 0x18 = GeneralizedTime (validity fields)
+    if tag in (0x17, 0x18):
+        try:
+            return val.decode("latin-1")
+        except Exception:
+            return None
+    try:
+        return val.decode("utf-8")
+    except Exception:
+        try:
+            return val.decode("latin-1")
+        except Exception:
+            return None
+
+
+def _parse_der_name(data):
+    """X.509 Name (SEQUENCE OF SET OF AttributeTypeAndValue) -> {oid: value}."""
+    attrs = {}
+    i = 0
+    while i < len(data):
+        tag, vs, ve = _read_tlv(data, i)
+        if tag != 0x31:  # SET
+            break
+        j = vs
+        while j < ve:
+            _, avs, ave = _read_tlv(data, j)
+            _, os_, oe = _read_tlv(data, avs)  # AttributeType (OID)
+            oid = _oid_to_str(data[os_:oe])
+            vt, ps, pe = _read_tlv(data, oe)  # AttributeValue
+            val = _parse_der_string(vt, data[ps:pe])
+            if val is not None:
+                attrs.setdefault(_OID_NAMES.get(oid, oid), val)
+            j = ave
+        i = ve
+    return attrs
+
+
+def _parse_der_cert(der):
+    """Extract {issuer, subject, not_before, not_after} from DER certificate."""
+    out = {"issuer": None, "subject": None, "not_before": None,
+           "not_after": None}
+    try:
+        tag, vs, ve = _read_tlv(der, 0)  # Certificate SEQUENCE
+        _, tbs_vs, tbs_ve = _read_tlv(der, vs)  # tbsCertificate SEQUENCE
+        i = tbs_vs
+        t, s, e = _read_tlv(der, i)
+        if t == 0xA0:  # optional explicit version
+            i = e
+        seq_idx = 0  # 0=sigAlg, 1=issuer, 2=validity, 3=subject, ...
+        while i < tbs_ve:
+            t, s, e = _read_tlv(der, i)
+            if t == 0x30:
+                if seq_idx == 1:
+                    out["issuer"] = _parse_der_name(der[s:e])
+                elif seq_idx == 2:
+                    # Validity SEQUENCE: notBefore, notAfter
+                    vi = s
+                    vt, vs_, ve_ = _read_tlv(der, vi)
+                    out["not_before"] = _parse_der_string(vt, der[vs_:ve_])
+                    vi = ve_
+                    vt, vs_, ve_ = _read_tlv(der, vi)
+                    out["not_after"] = _parse_der_string(vt, der[vs_:ve_])
+                elif seq_idx == 3:
+                    out["subject"] = _parse_der_name(der[s:e])
+                seq_idx += 1
+            i = e
+    except Exception:
+        pass
+    return out
+
+
+def _norm_time(t):
+    """UTCTime/GeneralizedTime (YYMMDDHHMMSSZ) -> 'YYYY-MM-DD HH:MM UTC'."""
+    if not t:
+        return None
+    s = t.rstrip("Zz")
+    if len(s) == 12:  # UTCTime YYMMDDHHMMSS
+        s = ("19" if int(s[:2]) >= 50 else "20") + s
+    if len(s) == 14:  # GeneralizedTime YYYYMMDDHHMMSS
+        try:
+            return (f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]} UTC")
+        except Exception:
+            return None
+    return t
+
+
+def _capture_tls_info(conn, ssl_ctx):
+    """Snapshot the peer certificate of a freshly opened (TLS) connection.
+
+    Returns a compact dict {enabled, fingerprint_sha256, issuer, subject,
+    not_after, self_signed} or None for plaintext connections. Certificate
+    failures never raise — the caller treats TLS like a probe error."""
+    if ssl_ctx is None:
+        return None
+    info = {"enabled": True, "fingerprint_sha256": None,
+            "issuer": None, "subject": None, "not_after": None,
+            "self_signed": None}
+    try:
+        ssl_obj = conn.writer.get_extra_info("ssl_object")
+        if ssl_obj is None:
+            return info
+        der = ssl_obj.getpeercert(True)  # DER bytes, always available
+        if der:
+            info["fingerprint_sha256"] = hashlib.sha256(der).hexdigest()
+            parsed = _parse_der_cert(der)
+            info["issuer"] = parsed["issuer"]
+            info["subject"] = parsed["subject"]
+            info["not_after"] = _norm_time(parsed["not_after"])
+            iss, sub = parsed["issuer"], parsed["subject"]
+            info["self_signed"] = bool(
+                iss is not None and sub is not None and iss == sub)
+        # ssl_object.getpeercert() dict (validated only; empty under CERT_NONE)
+        try:
+            certdict = ssl_obj.getpeercert()
+        except Exception:
+            certdict = {}
+        if certdict:
+            info["not_after"] = _norm_time(certdict.get("notAfter"))
+    except Exception:
+        pass
+    return info
+
+
 class _Conn:
-    __slots__ = ("reader", "writer")
+    __slots__ = ("reader", "writer", "tls_info", "ssl_ctx")
 
     @classmethod
-    async def open(cls, host, port, timeout):
+    async def open(cls, host, port, timeout, ssl_ctx=None):
         c = cls()
+        c.ssl_ctx = ssl_ctx
         c.reader, c.writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout)
+            asyncio.open_connection(host, port, ssl=ssl_ctx), timeout)
+        c.tls_info = _capture_tls_info(c, ssl_ctx)
         return c
 
     def close(self):
@@ -145,9 +327,12 @@ class _Conn:
         except Exception:
             pass
 
-    async def get(self, host, port, path, timeout):
+    async def get(self, host, port, path, timeout, ssl_ctx=None):
         """HTTP GET with one reconnect retry. Returns (status, body, headers)
-        where headers is a bounded dict of lowercased response headers."""
+        where headers is a bounded dict of lowercased response headers.
+        ssl_ctx defaults to this conn's TLS context (if it was opened with one),
+        so reconnects on a TLS conn keep speaking TLS."""
+        ssl_ctx = ssl_ctx if ssl_ctx is not None else getattr(self, "ssl_ctx", None)
         last_err = OSError("probe failed")
         for _ in range(2):
             try:
@@ -181,7 +366,8 @@ class _Conn:
                 self.close()
                 try:
                     self.reader, self.writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port), timeout)
+                        asyncio.open_connection(host, port, ssl=ssl_ctx), timeout)
+                    self.tls_info = _capture_tls_info(self, ssl_ctx)
                 except Exception as e2:
                     last_err = e2
         raise last_err
@@ -222,7 +408,8 @@ def _aux_needed(path, ep, sigs):
 
 async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
                      content_hashes=None, banner_prefilter=False,
-                     ptr_seed=False, diff_mode=False, conn_registry=None):
+                     ptr_seed=False, diff_mode=False, conn_registry=None,
+                     tls=False, tls_fallback=False):
     dossier = {
         "target": f"{host}:{port}", "product": "unknown", "verdict": "DARK",
         "version": None, "model": None, "models_served": [], "flags": [],
@@ -230,14 +417,18 @@ async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
         "asn": None, "as_name": None, "bgp_prefix": None, "net_type": None,
         "score": 0, "inventory_hash": None, "ptr": None,
         "verify_result": None, "verify_detail": None,
+        "tls": {"enabled": False, "fingerprint_sha256": None,
+                "issuer": None, "subject": None, "not_after": None,
+                "self_signed": None},
     }
     t0 = time.time()
     endpoints = dossier["endpoints"]
     disc = [p for p in paths if p in DISC_PATHS]
     aux = [p for p in paths if p not in DISC_PATHS]
 
-    # banner prefilter: skip HTTP entirely if the service is clearly not HTTP
-    if banner_prefilter:
+    # banner prefilter is a plaintext grab; don't trust it on a (possibly TLS)
+    # port, so skip it whenever TLS probing or a TLS fallback is in play.
+    if banner_prefilter and not tls and not tls_fallback:
         banner = await banner_grab(host, port, min(timeout, 1.0))
         if banner and banner_is_nonhttp(banner):
             dossier["error"] = "non-http"
@@ -247,25 +438,42 @@ async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
             return dossier
 
     nconns = max(1, min(4, len(disc)))
-    first_err = "connect failed"
-    try:
-        conns = await asyncio.gather(*(
-            _Conn.open(host, port, min(timeout, CONNECT_TIMEOUT))
-            for _ in range(nconns)))
-        conns = list(conns)
-        if conn_registry is not None:
-            # register live sockets so a cancellation/timeout mid-exchange can
-            # still close them via the caller's registry instead of leaking fd.
-            conn_registry.update(conns)
-    except Exception as e:
-        first_err = type(e).__name__
-        conns = []
+
+    async def _try_connect(ssl_ctx):
+        try:
+            conns = await asyncio.gather(*(
+                _Conn.open(host, port, min(timeout, CONNECT_TIMEOUT),
+                           ssl_ctx=ssl_ctx)
+                for _ in range(nconns)))
+            conns = list(conns)
+            if conn_registry is not None:
+                # register live sockets so a cancellation/timeout mid-exchange can
+                # still close them via the caller's registry instead of leaking fd.
+                conn_registry.update(conns)
+            return conns, None
+        except Exception as e:
+            return [], type(e).__name__
+
+    # TLS mode: if the caller asked for TLS (port 443), connect straight over
+    # TLS. Otherwise try plaintext; if the plaintext connect fails and TLS
+    # fallback is on (HTTPS-on-8000 nginx front), retry the connect once over TLS.
+    hello_ctx = _make_tls_ctx() if (tls and HTTPS_ENABLED) else None
+    conns, first_err = await _try_connect(hello_ctx)
+    if not conns and hello_ctx is None and tls_fallback and HTTPS_ENABLED:
+        conns, first_err = await _try_connect(_make_tls_ctx())
+        if conns:
+            dossier["flags"].append("TLS_FALLBACK")
+            dossier["tls_fallback"] = True
     if not conns:
         dossier["error"] = first_err
         dossier["latency_ms"] = round((time.time() - t0) * 1000)
         if probe_cb:
             probe_cb(host, port, "/", None, first_err)
         return dossier
+
+    # capture peer cert info from the first live socket if TLS is in use
+    if conns[0].tls_info:
+        dossier["tls"] = conns[0].tls_info
 
     async def probe_paths(conn, todo):
         for path in todo:
@@ -297,6 +505,29 @@ async def probe_host(host, port, paths, timeout, probe_cb, fast, fanout=False,
         sigs = detect_sigs(endpoints)
         aux = [p for p in aux if _aux_needed(p, endpoints, sigs)]
     await wave(aux)
+    # TLS fallback round 2: a TLS server accepts the plaintext TCP connect, so
+    # the first exchange can end with zero successful responses without the
+    # connect itself failing. When fallback is enabled and every endpoint came
+    # back empty, retry the whole exchange over TLS before giving up.
+    got = any(v["status"] is not None for v in endpoints.values())
+    if (not got and not tls and tls_fallback and HTTPS_ENABLED
+            and not dossier.get("tls_fallback")):
+        for c in conns:
+            c.close()
+        if conn_registry is not None:
+            conn_registry.difference_update(conns)
+        conns, first_err = await _try_connect(_make_tls_ctx())
+        if conns:
+            dossier["flags"].append("TLS_FALLBACK")
+            dossier["tls_fallback"] = True
+            if conns[0].tls_info:
+                dossier["tls"] = conns[0].tls_info
+            endpoints.clear()
+            await wave(disc)
+            if fast:
+                sigs = detect_sigs(endpoints)
+                aux = [p for p in aux if _aux_needed(p, endpoints, sigs)]
+            await wave(aux)
     for c in conns:
         c.close()
     if conn_registry is not None:
@@ -330,7 +561,7 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
                      fanout=False, skip_set=None, blocklist=None,
                      banner_prefilter=False, adaptive_timeout=False,
                      content_dedup=False, ptr_seed=False, diff_mode=False,
-                     verify=False):
+                     verify=False, tls=True):
     """Owns an asyncio loop in a dedicated thread; pushes events to q."""
     skip_set = skip_set or set()
     blocklist = blocklist or set()
@@ -414,6 +645,12 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
             d = None
             err = None
             try:
+                # TLS policy per target: port 443 (and --tls forced targets)
+                # always speak TLS first. Other ports try plaintext and fall
+                # back to TLS on connect failure when TLS_FALLBACK is enabled,
+                # so HTTPS-on-8000 (nginx-fronted) services get discovered.
+                tls_on = bool(tls and HTTPS_ENABLED and p == 443)
+                fallback = bool(tls and HTTPS_ENABLED and TLS_FALLBACK and p != 443)
                 async with sem:
                     d = await asyncio.wait_for(
                         probe_host(
@@ -422,7 +659,8 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
                             content_hashes=(sig_counts if content_dedup else None),
                             banner_prefilter=banner_prefilter,
                             ptr_seed=ptr_seed, diff_mode=diff_mode,
-                            conn_registry=live_conns),
+                            conn_registry=live_conns,
+                            tls=tls_on, tls_fallback=fallback),
                         _overall_deadline(timeout, len(paths)))
                     # normalize tuple return (fanout yields (d, neighbors))
                     if isinstance(d, tuple):
@@ -464,7 +702,8 @@ def run_async_engine(targets, paths, timeout, workers, enrich, fast, cancel, q,
                     try:
                         vr, vd = await asyncio.to_thread(
                             verify_inference, h, p,
-                            detect_sigs(d.get("endpoints") or {}))
+                            detect_sigs(d.get("endpoints") or {}),
+                            tls=bool((d.get("tls") or {}).get("enabled")))
                         d["verify_result"] = vr
                         d["verify_detail"] = vd
                         if vr == "honeypot":
@@ -588,7 +827,7 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
                 adaptive_timeout=False, content_dedup=False,
                 diff_mode=False, ptr_seed=False,
                 ct_search_seed=False, shodan_seed=False,
-                sweep_all_ports=False, verify=False):
+                sweep_all_ports=False, verify=False, tls=True):
     """Generator: yields start / probe / result / done / stopped events."""
     frameworks = [f for f in (frameworks or list(FRAMEWORKS)) if f in FRAMEWORKS]
     if not frameworks:
@@ -761,6 +1000,8 @@ def scan_events(lines, workers=1000, timeout=PROBE_TIMEOUT, cancel=None,
             "diff_mode": diff_mode, "ptr_seed": ptr_seed,
             "ct_search_seed": ct_search_seed, "shodan_seed": shodan_seed,
             "sweep_all_ports": sweep_all_ports, "verify": verify,
+            "tls": tls, "https_enabled": HTTPS_ENABLED,
+            "tls_verify": TLS_VERIFY, "tls_fallback": TLS_FALLBACK,
         },
     }
     verdict_counts = {"GENUINE": 0, "IMPOSTOR": 0, "UNKNOWN": 0,
