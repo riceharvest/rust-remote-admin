@@ -1,8 +1,10 @@
 """Auto-split from silicon_recon.py. Stdlib only."""
 import argparse
 import json
+import os
 import resource
 import sqlite3
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -14,6 +16,7 @@ from .config import (
 )
 from .db import list_scans
 from .engine import scan_events
+from .imports import import_file
 from .targets import country_cidrs, bgpview_prefixes
 from .packs import PACKS
 
@@ -381,6 +384,22 @@ PAGE = r"""<!DOCTYPE html>
   <div class="panel">
     <h2>&#9656; COLLECTION SUMMARY</h2>
     <div id="stats"><span class="stat">PROBED: <b>0</b></span><span class="stat">GENUINE: <b>0</b></span><span class="stat">IMPOSTOR: <b>0</b></span><span class="stat">UNKNOWN: <b>0</b></span><span class="stat">DARK: <b>0</b></span></div>
+  </div>
+
+  <div class="panel adv-only">
+    <h2>&#9656; IMPORT OFFLINE DATA (SHODAN / CENSYS)</h2>
+    <div class="fltbox" style="gap:10px; align-items:center; flex-wrap:wrap">
+      <label style="font-size:11px;color:var(--phos-dim);white-space:nowrap">FORMAT:</label>
+      <select id="import-fmt" style="background:#000;color:var(--phos);border:1px solid var(--line);padding:5px 8px;font:inherit">
+        <option value="auto">AUTO</option>
+        <option value="shodan">SHODAN JSONL</option>
+        <option value="censys">CENSYS JSON/CSV</option>
+      </select>
+      <input type="file" id="import-file-data" accept=".json,.jsonl,.csv" style="font-size:11px;color:var(--phos-dim)">
+      <button id="import-go-data" class="small">IMPORT</button>
+      <span id="import-data-info" class="hint" style="margin-left:8px"></span>
+    </div>
+    <div class="hint" style="margin-top:6px">// imports are tagged UNKNOWN + IMPORTED_* flags; they never auto-classify as GENUINE. refreshes history + table after import.</div>
   </div>
 
   <div class="panel adv-only">
@@ -762,6 +781,45 @@ $('import-file').onchange = ev => {
   const r = new FileReader();
   r.onload = () => { $('import').value = r.result; };
   r.readAsText(f);
+};
+
+// ---------- offline data import (shodan/censys) ----------
+$('import-go-data').onclick = async () => {
+  const fileInput = $('import-file-data');
+  const fmt = $('import-fmt').value;
+  const infoEl = $('import-data-info');
+  const file = fileInput.files[0];
+  if (!file) { infoEl.textContent = 'no file selected'; return; }
+  infoEl.textContent = 'uploading...';
+  const form = new FormData();
+  form.append('file', file);
+  if (fmt !== 'auto') form.append('format', fmt);
+  try {
+    const r = await fetch('/api/import', {method: 'POST', body: form});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'import failed');
+    log(`IMPORT: ${d.imported} rows from ${file.name} (${d.skipped} skipped, ${d.errors} errors) [${d.format}]`);
+    infoEl.textContent = `imported ${d.imported}, skipped ${d.skipped}, errors ${d.errors}`;
+    fileInput.value = '';
+    // Refresh history and table so imported UNKNOWN rows show
+    refreshHistory();
+    refreshTrendChart();
+    refreshCompareSelects();
+    if (d.imported > 0) {
+      // imported rows are NOT a real scan: load the synthetic __imported__ archive
+      const histEl = $('hist');
+      histEl.value = '__imported__';
+      if (histEl.value === '__imported__') $('hist-load').click();
+      else log('IMPORT: no archive entry for imported rows (refresh list and pick IMPORTED).', 'warn');
+    }
+    renderDossiers();
+    drawCharts();
+    updateIntel();
+    updateStats();
+  } catch (e) {
+    infoEl.textContent = 'error: ' + e.message;
+    log('IMPORT FAILED: ' + e.message, 'bad');
+  }
 };
 
 // ---------- fleet clusters + ASN aggregate ----------
@@ -1574,6 +1632,37 @@ def _db_scans():
             conn.close()
     except Exception:
         pass
+    # Surface offline-imported rows (scan_id IS NULL) as a synthetic archive
+    # entry so the console can load them; imported rows are NOT real scans.
+    try:
+        conn = sqlite3.connect(STATE_DB)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*), "
+                "       COALESCE(SUM(verdict='GENUINE'),0), "
+                "       COALESCE(SUM(verdict='IMPOSTOR'),0), "
+                "       COALESCE(SUM(verdict='UNKNOWN'),0), "
+                "       COALESCE(SUM(verdict='DARK'),0), "
+                "       COALESCE(SUM(verdict='ERROR'),0), "
+                "       MAX(scanned_at) "
+                "FROM targets WHERE scan_id IS NULL").fetchone()
+            n, genuine, impostor, unknown, dark, error, last_ts = row
+            if n:
+                when = (time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(last_ts))
+                        if last_ts else "")
+                out.insert(0, {
+                    "id": "__imported__", "when": when,
+                    "started_at": last_ts, "finished_at": None,
+                    "target_count": None, "params_json": None, "stats_json": None,
+                    "total": n, "genuine": genuine,
+                    "impostor": impostor, "unknown": unknown,
+                    "dark": dark, "error": error,
+                })
+        finally:
+            conn.close()
+    except Exception:
+        pass
     return out
 
 
@@ -1618,14 +1707,22 @@ def _db_scan_trend():
 
 
 def _db_results(scan_id):
-    """Rehydrate archive-loaded dossier dicts from the targets table."""
+    """Rehydrate archive-loaded dossier dicts from the targets table.
+
+    ``scan_id == "__imported__"`` loads offline-imported rows (scan_id IS
+    NULL); any other value loads rows for that real scan id.
+    """
+    if scan_id == "__imported__":
+        where, params = "scan_id IS NULL", ()
+    else:
+        where, params = "scan_id=?", (scan_id,)
     try:
         conn = sqlite3.connect(STATE_DB)
         conn.execute("PRAGMA busy_timeout = 5000")
         try:
             rows = conn.execute(
                 f"SELECT {','.join(_TARGET_COLS)} FROM targets "
-                "WHERE scan_id=? ORDER BY scanned_at", (scan_id,)).fetchall()
+                f"WHERE {where} ORDER BY scanned_at", params).fetchall()
         finally:
             conn.close()
     except Exception:
@@ -1782,6 +1879,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(502, json.dumps({"error": f"RIR fetch failed: {e}"}))
         elif self.path.startswith("/api/history?id="):
             sid = urllib.parse.unquote(self.path.split("id=", 1)[1].split("&", 1)[0])
+            if sid == "__imported__":
+                # offline-imported rows (scan_id IS NULL) surfaced as a
+                # synthetic archive entry; not a real scan.
+                return self._send(200, json.dumps({"results": _db_results("__imported__")}))
             try:
                 db_id = int(sid)
             except (TypeError, ValueError):
@@ -1817,7 +1918,97 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, '{"error":"not found"}')
 
+    def _parse_multipart(self, body: bytes, content_type: str):
+        """Parse multipart/form-data request body. Returns dict of field_name -> value (str or bytes for files)."""
+        # Extract boundary
+        if 'boundary=' not in content_type:
+            return {}
+        boundary = content_type.split('boundary=', 1)[1].strip().encode()
+        if not boundary:
+            return {}
+        # Split by boundary
+        parts = body.split(b'--' + boundary)
+        result = {}
+        for part in parts:
+            part = part.strip()
+            if not part or part == b'--':
+                continue
+            # Split headers and body
+            if b'\r\n\r\n' not in part:
+                continue
+            headers_raw, part_body = part.split(b'\r\n\r\n', 1)
+            part_body = part_body.rstrip(b'\r\n')
+            # Parse headers
+            headers = {}
+            for line in headers_raw.split(b'\r\n'):
+                if b': ' in line:
+                    k, v = line.split(b': ', 1)
+                    headers[k.decode().lower()] = v.decode()
+            # Get field name and filename from Content-Disposition
+            cd = headers.get('content-disposition', '')
+            field_name = None
+            filename = None
+            for token in cd.split(';'):
+                token = token.strip()
+                if token.startswith('name='):
+                    field_name = token[5:].strip('"')
+                elif token.startswith('filename='):
+                    filename = token[9:].strip('"')
+            if not field_name:
+                continue
+            if filename:
+                # File upload - store as dict with filename and content
+                result[field_name] = {'filename': filename, 'content': part_body}
+            else:
+                # Regular field
+                result[field_name] = part_body.decode('utf-8', errors='replace')
+        return result
+
     def do_POST(self):
+        if self.path == "/api/import":
+            # Multipart file upload for offline data import (Shodan/Censys)
+            try:
+                ctype = self.headers.get('Content-Type', '')
+                if not ctype.startswith('multipart/form-data'):
+                    return self._send(400, json.dumps({"error": "expected multipart/form-data"}))
+                # Read the full request body
+                clen = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(clen)
+                # Parse multipart form data
+                form = self._parse_multipart(body, ctype)
+                file_field = form.get('file')
+                if not file_field or 'content' not in file_field:
+                    return self._send(400, json.dumps({"error": "no file uploaded"}))
+                # Get format hint if provided
+                fmt = form.get('format', 'auto')
+                if fmt == 'auto':
+                    fmt = None
+                # Write uploaded file to temp location
+                with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.upload') as tmp:
+                    tmp.write(file_field['content'])
+                    tmp_path = tmp.name
+                try:
+                    # Call import_file with the temp file
+                    result = import_file(tmp_path, fmt=fmt, scan_id=None)
+                    # Add format to result for UI feedback
+                    if 'format' not in result:
+                        if fmt:
+                            result['format'] = fmt
+                        else:
+                            from .imports import detect_format
+                            try:
+                                result['format'] = detect_format(tmp_path)
+                            except Exception:
+                                result['format'] = 'unknown'
+                    self._send(200, json.dumps(result))
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            except Exception as e:
+                return self._send(400, json.dumps({"error": str(e)}))
+            return
         if self.path == "/api/stop":
             try:
                 n = int(self.headers.get("Content-Length", 0))

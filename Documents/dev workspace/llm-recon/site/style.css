@@ -1,0 +1,416 @@
+/* ============================================================================
+   SILICON RECON — public census site
+   Design system: "engraved terminal"
+   cream #f4f1e8 · ink #1a1a18 · ultramarine #1a2ee6 · 1px hairlines @35%
+   Didone serif display · dense monospace data · beveled/inset panels
+   ========================================================================== */
+
+:root {
+  --cream:  #f4f1e8;
+  --cream-2:#f8f6ef;   /* raised panel face */
+  --ink:    #1a1a18;
+  --blue:   #1a2ee6;
+  --gray:   #6b6a63;
+  --hair:   rgba(26, 26, 24, 0.35);   /* thin 1px hairlines */
+  --hair-soft: rgba(26, 26, 24, 0.18);
+  --hair-strong: rgba(26, 26, 24, 0.6);
+  --serif: Georgia, 'Times New Roman', 'Liberation Serif', serif;
+  --mono:  ui-monospace, 'Cascadia Mono', Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--cream);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------------------------------------------------------------------------
+   Hero plate
+   --------------------------------------------------------------------------- */
+
+.hero {
+  text-align: center;
+  padding: 48px 20px 40px;
+  border-bottom: 2px solid var(--ink);
+  box-shadow: 0 1px 0 var(--hair);
+  background:
+    linear-gradient(180deg, rgba(26, 26, 24, 0.025), rgba(26, 26, 24, 0) 40%),
+    var(--cream);
+}
+
+.hero-art {
+  width: min(430px, 86vw);
+  height: auto;
+  display: block;
+  margin: 0 auto 26px;
+}
+
+.kicker {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+  color: var(--blue);
+}
+
+.hero-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: clamp(2.1rem, 6.2vw, 4.1rem);
+  line-height: 1.06;
+  letter-spacing: 0.015em;
+  text-transform: uppercase;
+}
+
+.hero-title::after {
+  content: "";
+  display: block;
+  width: 72px;
+  height: 1px;
+  margin: 22px auto 0;
+  background: var(--ink);
+  opacity: 0.55;
+}
+
+.tagline {
+  margin: 18px auto 0;
+  max-width: 560px;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--ink);
+  opacity: 0.72;
+}
+
+/* ---------------------------------------------------------------------------
+   Layout
+   --------------------------------------------------------------------------- */
+
+.wrap {
+  max-width: 1060px;
+  margin: 0 auto;
+  padding: 34px 20px 90px;   /* bottom room for the sticky statusbar */
+}
+
+section { margin-bottom: 44px; }
+
+/* engraved section rules: hairline — label — hairline */
+.rule {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+.rule::before,
+.rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--hair);
+}
+.rule-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  white-space: nowrap;
+}
+.rule-label::before { content: "\2014\2002"; color: var(--hair-strong); }
+.rule-label::after  { content: "\2002\2014"; color: var(--hair-strong); }
+
+/* ---------------------------------------------------------------------------
+   Panels: beveled / inset engraved plates
+   --------------------------------------------------------------------------- */
+
+.panel {
+  background: var(--cream-2);
+  border: 1px groove rgba(26, 26, 24, 0.45);
+  border-radius: 2px;
+  padding: 18px 18px 16px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.65),
+    inset 0 -1px 0 rgba(26, 26, 24, 0.12),
+    0 1px 2px rgba(26, 26, 24, 0.08);
+}
+
+/* ---------------------------------------------------------------------------
+   Summary stat strip
+   --------------------------------------------------------------------------- */
+
+.stat-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  background: var(--cream-2);
+  border: 1px groove rgba(26, 26, 24, 0.45);
+  border-radius: 2px;
+  padding: 14px 16px 12px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    inset 0 -1px 0 rgba(26, 26, 24, 0.12);
+  min-width: 0;
+}
+
+.stat-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--ink);
+  opacity: 0.6;
+  margin-bottom: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.stat-num {
+  font-size: 1.85rem;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.stat-num.blue { color: var(--blue); }
+.stat-num.dim  { color: var(--gray); }
+
+.stat-note {
+  margin-top: 7px;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+  opacity: 0.5;
+}
+
+/* ---------------------------------------------------------------------------
+   Trend chart
+   --------------------------------------------------------------------------- */
+
+#trend-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.chart-title-note { /* reserved for future use */ }
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hair-soft);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.legend-swatch {
+  width: 16px;
+  height: 8px;
+  border: 1px solid rgba(26, 26, 24, 0.5);
+  background: repeating-linear-gradient(
+    45deg,
+    currentColor 0, currentColor 2px, transparent 2px, transparent 4px
+  );
+  opacity: 0.85;
+}
+
+/* ---------------------------------------------------------------------------
+   Tables
+   --------------------------------------------------------------------------- */
+
+.table-scroll { overflow-x: auto; }
+
+table.census {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+table.census th {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  text-align: left;
+  padding: 8px 12px 8px 0;
+  border-bottom: 1px solid var(--ink);
+  box-shadow: 0 1px 0 var(--hair);
+  white-space: nowrap;
+}
+
+table.census th.num,
+table.census td.num { text-align: right; }
+
+table.census td {
+  padding: 8px 12px 8px 0;
+  border-bottom: 1px solid var(--hair);       /* visible row rules */
+  vertical-align: top;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+table.census tbody tr:last-child td { border-bottom: none; }
+
+table.census td.model-cell {
+  white-space: normal;
+  font-size: 11.5px;
+  color: var(--ink);
+  opacity: 0.85;
+}
+
+table.census .fw {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+table.census .genuine-ok { color: var(--blue); font-weight: 700; }
+
+/* dim bucket: k-anonymity "other" row */
+table.census tr.dim td,
+td.dim {
+  color: var(--gray);
+  opacity: 0.55;
+  font-style: italic;
+}
+
+.placeholder-cell {
+  padding: 22px 0 !important;
+  text-align: center;
+  color: var(--gray);
+  opacity: 0.7;
+  font-style: italic;
+  letter-spacing: 0.06em;
+  white-space: normal !important;
+}
+
+/* ---------------------------------------------------------------------------
+   Geo / regions
+   --------------------------------------------------------------------------- */
+
+.geo-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.geo-chip {
+  border: 1px solid var(--hair);
+  padding: 3px 9px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  background: var(--cream);
+}
+.geo-chip b { font-weight: 700; color: var(--blue); }
+.geo-chip.dim { opacity: 0.55; font-style: italic; }
+
+/* ---------------------------------------------------------------------------
+   Placeholders (graceful degradation)
+   --------------------------------------------------------------------------- */
+
+.placeholder {
+  color: var(--gray);
+  opacity: 0.55;
+  font-style: italic;
+  letter-spacing: 0.05em;
+  font-size: 12.5px;
+  text-align: center;
+  padding: 20px 10px;
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Status bar — hashcat style, dark console accent
+   --------------------------------------------------------------------------- */
+
+.statusbar {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 0;
+  background: var(--ink);
+  color: var(--cream);
+  font-size: 11px;
+  letter-spacing: 0.07em;
+  padding: 9px 16px;
+  box-shadow: 0 -2px 0 rgba(26, 26, 24, 0.9), 0 -6px 14px rgba(26, 26, 24, 0.25);
+}
+
+.statusbar span {
+  padding: 0 12px;
+  border-right: 1px solid rgba(244, 241, 232, 0.28);
+  white-space: nowrap;
+}
+.statusbar span:first-child { padding-left: 0; }
+.statusbar span:last-child  { border-right: none; }
+
+.statusbar .sb-blue { color: #7d8bff; }   /* readable ultramarine on ink */
+.statusbar .sb-muted { opacity: 0.55; }
+
+/* ---------------------------------------------------------------------------
+   Misc
+   --------------------------------------------------------------------------- */
+
+.noscript {
+  margin: 0;
+  padding: 14px 20px;
+  background: var(--ink);
+  color: var(--cream);
+  font-size: 12px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Responsive
+   --------------------------------------------------------------------------- */
+
+@media (max-width: 720px) {
+  .wrap { padding: 26px 14px 90px; }
+  .stat-strip { grid-template-columns: repeat(2, 1fr); }
+  .hero { padding: 34px 16px 30px; }
+  .statusbar { font-size: 10px; }
+  table.census { font-size: 12px; }
+}
+
+@media (max-width: 420px) {
+  .stat-strip { grid-template-columns: 1fr; }
+}
+
+/* print: flatten the sticky bar */
+@media print {
+  .statusbar { position: static; }
+  body { background: #fff; }
+}
